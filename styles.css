@@ -1,0 +1,23 @@
+.base-path-updater-history .base-path-updater-operation {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-3);
+  margin-block: var(--size-4-3);
+}
+.base-path-updater-history details {
+  margin-block: var(--size-4-2);
+}
+.base-path-updater-history summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.base-path-updater-history .base-path-updater-change {
+  padding-block: var(--size-2-1);
+  overflow-wrap: anywhere;
+}
+.base-path-updater-history .base-path-updater-error {
+  color: var(--text-error);
+}
+.base-path-updater-history .base-path-updater-muted {
+  color: var(--text-muted);
+}

@@ -1,0 +1,7 @@
+node_modules/
+main.js
+dist/
+coverage/
+*.log
+.tools/
+data.json

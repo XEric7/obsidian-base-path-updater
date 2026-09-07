@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-base-path-updater",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Keep Obsidian Bases paths in sync with folder moves.",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs --watch",
+    "build": "npm run typecheck && node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run test && npm run build",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1",
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}

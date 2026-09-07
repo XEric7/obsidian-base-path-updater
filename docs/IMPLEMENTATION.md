@@ -1,99 +1,101 @@
-# Base Path Updater 实现说明
+# Base Path Updater Implementation Notes
 
-## 目标与范围
+[English](IMPLEMENTATION.md) · [简体中文](IMPLEMENTATION.zh-CN.md)
 
-解决文件夹移动、重命名后 `.base` 中固定路径引用失效的问题。首版保留原需求的事件驱动方式，增加结构化识别、串行处理、写入前快照和冲突保护。普通笔记修改不触发工作，不接管 Obsidian 的链接更新。
+## Goals and scope
 
-用户说明放在 [README](../README.md)，此文件说明实现取舍和后续维护方式。
+This plugin keeps fixed path references in `.base` files valid after folders are moved or renamed. The first release keeps the original event-driven approach while adding structured recognition, serialized processing, write-ahead snapshots, and conflict protection. Ordinary note edits do not trigger work, and the plugin does not take over Obsidian's link updating.
 
-## 研究依据
+User-facing documentation is in the [README](../README.md). This document explains implementation decisions and maintenance practices.
 
-开发前查阅的官方资料：
+## Research basis
 
-- [构建插件](https://docs.obsidian.md/Plugins/Getting%20started/Build%20a%20plugin)：插件入口、manifest 和本地加载方式。
-- [官方示例工程](https://github.com/obsidianmd/obsidian-sample-plugin)：TypeScript、esbuild 和外置 `obsidian` 依赖的项目结构参考。本项目未复制示例业务代码。
-- [Vault API](https://docs.obsidian.md/Plugins/Vault)：通过 `Vault.process()` 在当前文件内容上执行受保护的更新。
-- [事件注册](https://docs.obsidian.md/Plugins/Events)：事件通过 `registerEvent()` 注册，由宿主负责卸载。
-- [加载性能](https://docs.obsidian.md/plugins/guides/load-time)：启动阶段会触发文件创建事件，初始索引延迟到布局就绪。
-- [Bases YAML 格式](https://help.obsidian.md/bases/syntax)：全局和视图级 `filters`、嵌套的 `and/or/not`、`formulas` 均可含表达式。
-- [Bases 函数](https://help.obsidian.md/bases/functions)：字符串及路径函数的语义。
+The following official resources were consulted during development:
 
-这些资料支持直接维护 `.base` 文件，无需注册新的 Bases 视图，也无需依赖第三方插件的私有 API。
+- [Build a plugin](https://docs.obsidian.md/Plugins/Getting%20started/Build%20a%20plugin): plugin entry points, manifests, and local loading.
+- [Official sample project](https://github.com/obsidianmd/obsidian-sample-plugin): project structure using TypeScript, esbuild, and an external `obsidian` dependency. This project did not copy sample business code.
+- [Vault API](https://docs.obsidian.md/Plugins/Vault): protected updates to current file content through `Vault.process()`.
+- [Events](https://docs.obsidian.md/Plugins/Events): event registration and host-managed cleanup through `registerEvent()`.
+- [Load time](https://docs.obsidian.md/plugins/guides/load-time): file creation events during startup and delaying the initial index until layout is ready.
+- [Bases syntax](https://help.obsidian.md/bases/syntax): expressions in global and view-level `filters`, nested `and/or/not`, and `formulas`.
+- [Bases functions](https://help.obsidian.md/bases/functions): string and path function semantics.
 
-## 模块划分
+These sources support maintaining `.base` files directly without registering new Bases views or depending on private APIs from third-party plugins.
 
-| 文件                   | 职责                                             |
-| ---------------------- | ------------------------------------------------ |
-| `src/main.ts`          | 插件生命周期、文件索引、串行任务、持久化及撤回   |
-| `src/base-document.ts` | 定位 YAML 中允许修改的表达式，按源文件范围打补丁 |
-| `src/expressions.ts`   | 表达式分词、固定路径识别、路径边界及字符串转义   |
-| `src/history.ts`       | 历史数据结构、容量统计、加载校验及撤回条件       |
-| `src/ui.ts`            | 历史弹窗、路径差异、撤回入口及错误反馈           |
-| `tests/`               | 纯函数测试和模拟 Obsidian API 的生命周期测试     |
+## Module structure
 
-## 事件与索引
+| File                   | Responsibility                                                                        |
+| ---------------------- | ------------------------------------------------------------------------------------- |
+| `src/main.ts`          | Plugin lifecycle, file index, serialized tasks, persistence, and undo                 |
+| `src/base-document.ts` | Locates expressions that may be changed in YAML and patches their source ranges       |
+| `src/expressions.ts`   | Expression tokenization, fixed-path recognition, path boundaries, and string escaping |
+| `src/history.ts`       | History data structures, size accounting, validation, and undo conditions             |
+| `src/ui.ts`            | History modal, path differences, undo entry points, and error feedback                |
+| `tests/`               | Pure-function tests and lifecycle tests using a simulated Obsidian API                |
 
-1. 加载并验证插件 `data.json`。无法读取或格式不受支持时暂停自动写入，避免覆盖旧历史。
-2. 注册事件；`onLayoutReady()` 时调用一次 `vault.getFiles()`，将 `.base` 的 `TFile` 对象存入 `Set`，不预读正文。
-3. 创建、删除、文件改名时增量维护索引。文件夹移动保留 `TFile` 对象引用，由宿主维护当前路径。
-4. 文件夹 `rename` 事件立即捕获 `oldPath`、`newPath` 和候选文件列表，再加入 Promise 队列。
-5. 顺序读取候选 Base，仅对命中内容解析、写入。普通文件改名只维护索引与历史位置，不扫描内容。
-6. 插件卸载时停止尚未开始的工作，循环在文件间检查停止标记。已提交给宿主的单次写入不能取消。
+## Events and indexing
 
-自动更新和撤回共享队列，避免连续移动或重复点击造成相互覆盖。没有定时器，也不监听普通 `modify` 事件。
+1. Load and validate plugin `data.json`. If it cannot be read or has an unsupported format, pause automatic writes to avoid overwriting old history.
+2. Register events. On `onLayoutReady()`, call `vault.getFiles()` once and store `.base` `TFile` objects in a `Set` without pre-reading their contents.
+3. Maintain the index incrementally when files are created, deleted, or renamed. Folder moves keep the `TFile` object references while the host updates their current paths.
+4. Capture `oldPath`, `newPath`, and the candidate file list immediately on a folder `rename` event, then add the work to the promise queue.
+5. Read candidate Bases sequentially and parse/write only files with matching content. Ordinary file renames update the index and history paths but do not scan content.
+6. When the plugin unloads, stop work that has not started; the loop checks the stop flag between files. A single write already submitted to the host cannot be cancelled.
 
-## 路径与 YAML 改写
+Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer and ordinary `modify` events are not observed.
 
-不使用全文件字符串替换，也不整体重新序列化 YAML。
+## Path and YAML rewriting
 
-- 先检查源文本是否包含旧路径。文本含反斜杠时仍解析，避免漏掉 YAML 或表达式中的转义路径。
-- 用 `yaml` 库解析节点及原文范围。YAML 无效时记录异常并跳过该文件。
-- 只遍历根 `filters`、`views[*].filters` 及根 `formulas` 的值。过滤器递归处理 `and/or/not`。
-- 以完整字符串 token 区分字面量和代码，识别 `file.inFolder(常量)`、`file.path.startsWith(常量)`、`file.path == 常量` 及反向相等比较。
-- 左右边界检查排除 `this.file`、其他属性链和动态拼接等情况。首版不是完整表达式编译器；包含字符串外 `/` 的表达式整体跳过，因而也不处理除法或正则所在的同一表达式。
-- 只匹配 `path === oldPath` 或 `path.startsWith(oldPath + '/')`。保持相对仓库路径、大小写和尾部斜杠，不做模糊推断。
-- 仅替换命中 YAML 标量的源文件范围。新值编码为 YAML 双引号字符串；外部缩进、无关行、注释和换行保留。命中的块标量转为引号字符串，保留其语义及头部注释。
-- 有锚点或自定义标签的标量不修改；别名不解析，避免改动共享值影响显示名称等非目标字段。
-- 更新后再次校验 YAML，可解析才返回结果。
+The plugin does not replace text across an entire file or serialize the whole YAML document again.
 
-`startsWith("Work")` 本身是字符串前缀语义，也可能筛到 `Workshop`。插件只替换明确的路径常量，不重写筛选条件的逻辑；README 推荐使用 `"Work/"`。
+- First check whether the source contains the old path. If the text contains a backslash, still parse it so escaped YAML or expression paths are not missed.
+- Parse nodes and source ranges with the `yaml` library. Invalid YAML is recorded and skipped.
+- Traverse only the values of root `filters`, `views[*].filters`, and root `formulas`. Filters are handled recursively through `and/or/not`.
+- Use complete string tokens to distinguish literals from code. Recognize `file.inFolder(constant)`, `file.path.startsWith(constant)`, `file.path == constant`, and the reversed equality comparison.
+- Check left and right boundaries to exclude `this.file`, other property chains, and dynamic concatenation. This is not a complete expression compiler; an expression containing `/` outside strings is skipped as a whole, so division or regular expressions in that expression are not processed.
+- Match only `path === oldPath` or `path.startsWith(oldPath + '/')`. Preserve vault-relative paths, case, and trailing slashes without fuzzy inference.
+- Replace only the source range of the matching YAML scalar. Encode the new value as a YAML double-quoted string while preserving surrounding indentation, unrelated lines, comments, and line endings. Block scalars that match are converted to quoted strings while preserving header comments.
+- Do not modify scalars with anchors or custom tags. Do not resolve aliases, so shared values cannot accidentally affect display names or other non-target fields.
+- Validate the updated YAML again before returning the result.
 
-## 写入、历史与撤回
+`startsWith("Work")` has normal string-prefix semantics and may also match `Workshop`. The plugin changes only explicit path constants and does not rewrite the filter's logic; the README recommends using `"Work/"`.
 
-每次文件夹变化形成一条操作，保存时间、旧/新文件夹路径、每个 Base 的完整前后快照、路径差异和异常。历史以 `version: 1` 存在插件 `data.json` 中。
+## Writes, history, and undo
 
-每个文件的写入顺序：
+Each folder change creates an operation containing its timestamp, old and new folder paths, complete before-and-after snapshots for each affected Base, path differences, and errors. History is stored as `version: 1` in the plugin's `data.json`.
 
-1. 读取文件并计算候选变更。
-2. 加入快照，淘汰超出 30 条或容量预算的最旧记录。当前操作不拆散淘汰；当前操作本身超预算时跳过该文件。
-3. **先成功保存历史，再修改 Base**。存储失败时暂停后续任务。
-4. 使用 `vault.process()`，在回调内检查当前内容仍与读取快照完全一致，否则跳过并记录冲突。
-5. 汇总处理异常并保存历史。
+For each file, the write order is:
 
-这是逐文件的可恢复操作，不是跨多个文件的原子事务。某个文件失败不阻止其他文件；可能出现部分更新。
+1. Read the file and calculate candidate changes.
+2. Add a snapshot, evicting the oldest operations beyond 30 entries or the size budget. The current operation is not split during eviction; if the operation itself exceeds the budget, skip that file.
+3. **Save history successfully before modifying the Base.** Pause later tasks if storage fails.
+4. Use `vault.process()` and check inside the callback that the current content still exactly matches the read snapshot; otherwise skip it as a conflict.
+5. Summarize processing errors and save history.
 
-撤回同样通过 `vault.process()` 比较完整内容：
+This is a recoverable per-file operation, not an atomic transaction across multiple files. A failure in one file does not prevent other files from being processed, so a partial update is possible.
 
-- 当前内容等于 `after`：恢复 `before`。
-- 当前内容等于 `before`：视为已经恢复或原写入尚未发生，不重复修改内容。
-- 其他内容：标记冲突，保留当前文件。
-- 原文件删除或不再是 `.base`：不恢复、不重建。运行期间观察到的删除会持久标记，避免对同路径新文件执行撤回。
+Undo also uses `vault.process()` to compare complete contents:
 
-写入前快照也允许在进程中断后判断是否实际写入。历史中的「已记录」表示已有可核对的快照，并非对中断事务成功状态的承诺。重启后按当前内容核对，无法仅靠路径识别插件关闭期间被删除又重建且内容完全相同的文件。
+- If the current content equals `after`, restore `before`.
+- If the current content equals `before`, treat it as already restored or as a write that never happened; do not write again.
+- Otherwise mark a conflict and preserve the current file.
+- If the original file was deleted or is no longer a `.base` file, do not restore or recreate it. Deletions observed during runtime are persisted so undo cannot target a new file at the same path.
 
-历史随插件观察到的 Base/父文件夹改名维护文件路径；关闭期间的位置变化无法追踪。撤回不反向移动文件夹，历史也不替代完整备份。
+The write-ahead snapshot can show whether a write happened after a process interruption. A history entry marked as recorded means that a verifiable snapshot exists; it does not promise that an interrupted transaction completed. After a restart, current content is checked. A file deleted and recreated with identical content while the plugin was disabled cannot be identified by path alone.
 
-完整快照允许严格冲突保护，但用户即使只修改了注释也会导致撤回跳过。首版选择保守跳过，而非可能错误合并的局部反向替换。
+History updates Base and parent-folder paths when the plugin observes their renames; moves while it is disabled cannot be tracked. Undo never moves folders and history is not a replacement for a complete backup.
 
-## 性能边界
+Complete snapshots provide strict conflict protection, but even a user change to a comment causes undo to skip the file. The first release chooses conservative skipping instead of risking an incorrect partial reverse replacement.
 
-启动是一次文件列表遍历；日常修改不读 Base。每次文件夹变化的读 I/O 与 Base 总大小成正比，解析仅发生于可能命中的文件。顺序读写避免瞬时大批 I/O；不维护内容缓存或持续解析索引。
+## Performance boundaries
 
-最多保留 30 条操作，快照预算为 5 MiB；错误说明等少量元数据可能使最终 JSON 略超预算。容量按 UTF-8 字节计算。由于每次文件写入前要保存快照，单次大量命中的场景有额外序列化和磁盘成本；当前没有实测大型仓库的耗时承诺。未来可按真实数据决定是否引入独立日志文件，避免过早增加复杂度。
+Startup performs one file-list traversal; ordinary edits do not read Base contents. Each folder change performs I/O proportional to the total size of candidate Bases, and parsing occurs only for files that may contain a match. Sequential reads and writes avoid large bursts of I/O; there is no content cache or continuously parsed index.
 
-## 开发与构建
+At most 30 operations are retained, with a 5 MiB snapshot budget. Small metadata such as error messages may make the final JSON slightly exceed the budget. Size is measured in UTF-8 bytes. Because each file's snapshot is saved before its write, a large batch of matches incurs extra serialization and disk cost; there is currently no performance claim for large vaults. A separate log file may be considered after real usage data is available, rather than adding complexity prematurely.
 
-使用 Node.js 22.12+（本次验证环境为 Node.js 24）及 npm：
+## Development and build
+
+Use Node.js 22.12+ (the validation environment used Node.js 24) and npm:
 
 ```sh
 npm ci
@@ -101,30 +103,30 @@ npm run check
 npm run dev
 ```
 
-`npm run check` 运行自动测试、TypeScript 检查及生产构建。`npm run dev` 监听源码并生成根目录 `main.js`，供本地插件目录开发使用。
+`npm run check` runs the automated tests, TypeScript check, and production build. `npm run dev` watches the source and generates the root `main.js` used for local plugin development.
 
 ```sh
 npm run build
 npm run format:check
 ```
 
-生产安装文件在 `dist/base-path-updater/`，包含 `main.js`、`manifest.json`、`styles.css`。`obsidian` 由宿主提供，`yaml` 随插件打包，不访问网络。源码、构建配置和 lockfile 纳入 Git，依赖、安装产物及历史数据忽略。发布前维护 manifest 作者、版本号及 `versions.json`。
+Production installation files are written to `dist/base-path-updater/` and contain `main.js`, `manifest.json`, and `styles.css`. `obsidian` is provided by the host, while `yaml` is bundled with the plugin; the plugin makes no network requests. Source code, build configuration, and the lockfile are tracked in Git, while dependencies, build outputs, and history data are ignored. Before a release, update the manifest author, version, and `versions.json`.
 
-## 验证与手动验收
+## Validation and manual acceptance
 
-自动测试覆盖路径边界、嵌套筛选、引号与转义、CRLF、块标量、注释、锚点保护、动态表达式跳过、无效 YAML、队列顺序、写入前并发修改、历史保存失败、重启撤回、删除保护及卸载停止。宿主通过模拟 API 测试；这不等于已在真实 Obsidian 客户端完成端到端验证。
+Automated tests cover path boundaries, nested filters, quotes and escapes, CRLF, block scalars, comments, anchor protection, skipped dynamic expressions, invalid YAML, queue ordering, concurrent edits before writes, history-save failures, undo after restart, deletion protection, and stopping on unload. The host is represented by a simulated API; this is not the same as end-to-end testing in the real Obsidian client.
 
-建议在测试仓库完成以下验收：
+Recommended acceptance checks in a test vault:
 
-1. 新建 `Work/Research/笔记.md`，创建包含 README 三种条件及视图级筛选的 Base。
-2. 重命名 `Research`，确认筛选仍能找到笔记，历史展示路径变化。
-3. 将整个 `Work` 移入其他目录，再连续移动两次；检查 Base 位于被移动文件夹内部时仍正确更新。
-4. 打开历史，从新到旧撤回，确认只恢复 Base 内容，文件夹位置未改变。
-5. 修改某个 Base 注释后撤回，确认该文件被跳过，其他文件能正常恢复。
-6. 重启 Obsidian 后查看历史并撤回；分别检查侧边栏菜单、命令面板和设置页入口。
-7. 创建、删除及重命名 `.base`，确认索引随之更新；普通笔记编辑不产生历史。
-8. 检查浅色/深色主题和移动端弹窗。插件未使用桌面专属 API，但移动端尚需真机验收。
+1. Create `Work/Research/Notes.md` and a Base containing the three conditions from the README, including a view-level filter.
+2. Rename `Research` and confirm that the filter still finds the note and that history shows the path change.
+3. Move the entire `Work` folder into another directory and then move it twice more; confirm that Bases inside the moved folder are updated correctly.
+4. Open history and undo from newest to oldest. Confirm that only Base content is restored and folder locations do not change.
+5. Edit a comment in one Base before undoing. Confirm that the file is skipped while other files can still be restored.
+6. Restart Obsidian, inspect history, and undo. Check the ribbon menu, command palette, and settings entry points.
+7. Create, delete, and rename `.base` files and confirm that the index follows them; ordinary note edits should not create history.
+8. Check light and dark themes and the mobile modal. The plugin does not use desktop-only APIs, but mobile still requires testing on a real device.
 
-## 后续可选改进
+## Possible future improvements
 
-基于实际需求再考虑更多路径函数、嵌入 Base、文件级移动、手动修复预览及精确表达式语法树。扩展支持时同步增加误匹配测试，不把普通路径字符串当成引用自动修改。
+Based on actual needs, consider more path functions, embedded Bases, file-level moves, a manual repair preview, and a precise expression syntax tree. Add false-positive tests alongside any new supported syntax, and do not automatically rewrite ordinary path strings as references.

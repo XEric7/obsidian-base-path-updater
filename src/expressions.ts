@@ -53,7 +53,9 @@ function decodeString(text: string): string {
     '/': '/',
   };
   return text.slice(1, -1).replace(/\\(u[\da-fA-F]{4}|x[\da-fA-F]{2}|.)/g, (_, escape: string) => {
-    if (/^[ux]/.test(escape)) return String.fromCharCode(parseInt(escape.slice(1), 16));
+    if (/^(?:u[\da-fA-F]{4}|x[\da-fA-F]{2})$/.test(escape)) {
+      return String.fromCharCode(parseInt(escape.slice(1), 16));
+    }
     if (!(escape in escapes)) throw new Error('Unsupported string escape');
     return escapes[escape]!;
   });

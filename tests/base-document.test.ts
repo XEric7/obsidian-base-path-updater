@@ -4,6 +4,11 @@ import { updateBase } from '../src/base-document';
 import { movePath, updateExpression } from '../src/expressions';
 
 describe('path expressions', () => {
+  it('skips malformed hexadecimal escapes', () => {
+    const expression = 'file.inFolder("Old/\\uZZZZ")';
+    expect(updateExpression(expression, 'Old', 'New').text).toBe(expression);
+  });
+
   it.each([
     ['file.inFolder("Work/Research")', 'file.inFolder("Archive/Research")'],
     ["file.inFolder('Work/Research/Sub')", "file.inFolder('Archive/Research/Sub')"],

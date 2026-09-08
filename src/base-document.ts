@@ -1,20 +1,24 @@
 import { isMap, isScalar, isSeq, parseDocument } from 'yaml';
 import { updateExpression, type PathChange } from './expressions';
+import { PluginError } from './errors';
 
+/** Contains updated YAML text and the path changes applied to its expressions. */
 export interface BaseUpdate {
   text: string;
   changes: PathChange[];
 }
 
+/** Rewrites supported references from oldPath to newPath in source YAML and returns text plus changes. */
 export function updateBase(source: string, oldPath: string, newPath: string): BaseUpdate {
   // Escaped paths may not appear literally in the source; do not reject those.
   if (!source.includes(oldPath) && !source.includes('\\')) return { text: source, changes: [] };
   const document = parseDocument(source, { uniqueKeys: true });
-  if (document.errors.length) throw new Error('Base YAML 无效，已跳过');
+  if (document.errors.length) throw new PluginError({ code: 'invalidYaml' });
   const edits: { start: number; end: number; value: string }[] = [];
   const changes: PathChange[] = [];
   const visited = new Set<unknown>();
 
+  /** Adds edits for a supported scalar node, leaving unrelated or shared nodes untouched. */
   const expression = (node: unknown) => {
     if (
       !isScalar(node) ||
@@ -37,6 +41,7 @@ export function updateBase(source: string, oldPath: string, newPath: string): Ba
     edits.push({ start, end, value: JSON.stringify(result.text) + headerComment + newline });
     changes.push(...result.changes);
   };
+  /** Visits an unknown filter node and collects edits from supported logical branches. */
   const filters = (node: unknown) => {
     if (isScalar(node)) expression(node);
     else if (isSeq(node)) node.items.forEach(filters);
@@ -61,6 +66,6 @@ export function updateBase(source: string, oldPath: string, newPath: string): Ba
     text = text.slice(0, edit.start) + edit.value + text.slice(edit.end);
   }
   if (edits.length && parseDocument(text).errors.length)
-    throw new Error('更新后的 YAML 校验失败，已跳过');
+    throw new PluginError({ code: 'updatedYamlInvalid' });
   return { text, changes };
 }

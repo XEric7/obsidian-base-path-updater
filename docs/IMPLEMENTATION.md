@@ -31,7 +31,11 @@ These sources support maintaining `.base` files directly without registering new
 | `src/expressions.ts`   | Expression tokenization, fixed-path recognition, path boundaries, and string escaping |
 | `src/history.ts`       | History data structures, size accounting, validation, and undo conditions             |
 | `src/ui.ts`            | History modal, path differences, undo entry points, and error feedback                |
+| `src/i18n.ts`          | English/Chinese UI messages, error formatting, and localized dates                    |
+| `src/errors.ts`        | Failure codes and parameters, exception serialization, and legacy message migration   |
 | `tests/`               | Pure-function tests and lifecycle tests using a simulated Obsidian API                |
+
+`src/write-coordinator.ts` coordinates outstanding writes in the same host so plugin reloads do not read stale history.
 
 ## Events and indexing
 
@@ -40,7 +44,7 @@ These sources support maintaining `.base` files directly without registering new
 3. Maintain the index incrementally when files are created, deleted, or renamed. Folder moves keep the `TFile` object references while the host updates their current paths.
 4. Capture `oldPath`, `newPath`, and the candidate file list immediately on a folder `rename` event, then add the work to the promise queue.
 5. Read candidate Bases sequentially and parse/write only files with matching content. Ordinary file renames update the index and history paths but do not scan content.
-6. When the plugin unloads, stop work that has not started; the loop checks the stop flag between files. A single write already submitted to the host cannot be cancelled.
+6. After unload, stop checks at async read/save boundaries and process callbacks prevent further writes. A write already submitted to the host cannot be cancelled, so a replacement instance waits for outstanding writes before reading history. A global Symbol stores a WeakMap of pending writes across module reloads; completed entries are removed.
 
 Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer and ordinary `modify` events are not observed.
 
@@ -62,12 +66,24 @@ The plugin does not replace text across an entire file or serialize the whole YA
 
 ## Writes, history, and undo
 
-Each folder change creates an operation containing its timestamp, old and new folder paths, complete before-and-after snapshots for each affected Base, path differences, and errors. History is stored as `version: 1` in the plugin's `data.json`.
+Each folder change creates an operation containing its timestamp, old and new folder paths, complete before-and-after snapshots for each affected Base, path differences, and errors. History is stored as `version: 2` in the plugin's `data.json`.
+
+Plugin failures store a stable `code` and any required `params`. Operation failures store the event-time file path separately and are translated when displayed. System and third-party errors use `external` with the original message. Paths, Base content, and snapshots are never translated.
+
+Loading supports `version: 1`: exact known Chinese plugin messages become structured failures, while unknown text is preserved verbatim. Migration leaves the input object and snapshots unchanged. It happens in memory and is persisted on the next normal history save. Corrupt data, unknown versions, or unknown failure codes pause automatic writes. Older plugin builds cannot read v2 history and will refuse it after a downgrade; do not relabel v2 data as v1.
+
+## UI language
+
+The public `getLanguage()` API selects simplified Chinese for Chinese locales and English otherwise. Commands, menus, settings, notifications, modal statuses, and errors share centralized translations. Language changes follow Obsidian's reload flow to register commands and search metadata again. Each history render uses the current language; dates use the same locale and the local time zone.
+
+Settings definitions include both English and Chinese search terms. Command names use the selected language while command IDs remain stable. Obsidian 1.13+ uses declarative settings; older versions use `display()`. Both share translations and history actions without duplicating business logic.
+
+## Write ordering and conflict protection
 
 For each file, the write order is:
 
 1. Read the file and calculate candidate changes.
-2. Add a snapshot, evicting the oldest operations beyond 30 entries or the size budget. The current operation is not split during eviction; if the operation itself exceeds the budget, skip that file.
+2. Check that the active operation plus its candidate snapshot fits on its own before adding it or evicting older records beyond 30 operations or the total capacity budget. Skip candidates that cannot fit. If every candidate was rejected for capacity, only show a skip notice without consuming a history slot or saving the journal; all existing records are retained, even at the 30-operation limit.
 3. **Save history successfully before modifying the Base.** Pause later tasks if storage fails.
 4. Use `vault.process()` and check inside the callback that the current content still exactly matches the read snapshot; otherwise skip it as a conflict.
 5. Summarize processing errors and save history.
@@ -112,6 +128,8 @@ npm run format:check
 
 Production installation files are written to `dist/base-path-updater/` and contain `main.js`, `manifest.json`, and `styles.css`. `obsidian` is provided by the host, while `yaml` is bundled with the plugin; the plugin makes no network requests. Source code, build configuration, and the lockfile are tracked in Git, while dependencies, build outputs, and history data are ignored. Before a release, update the manifest author, version, and `versions.json`.
 
+For tag-triggered releases, see the [release guide](RELEASING.md) (Chinese).
+
 ## Validation and manual acceptance
 
 Automated tests cover path boundaries, nested filters, quotes and escapes, CRLF, block scalars, comments, anchor protection, skipped dynamic expressions, invalid YAML, queue ordering, concurrent edits before writes, history-save failures, undo after restart, deletion protection, and stopping on unload. The host is represented by a simulated API; this is not the same as end-to-end testing in the real Obsidian client.
@@ -126,6 +144,7 @@ Recommended acceptance checks in a test vault:
 6. Restart Obsidian, inspect history, and undo. Check the ribbon menu, command palette, and settings entry points.
 7. Create, delete, and rename `.base` files and confirm that the index follows them; ordinary note edits should not create history.
 8. Check light and dark themes and the mobile modal. The plugin does not use desktop-only APIs, but mobile still requires testing on a real device.
+9. Start Obsidian in English and Chinese and inspect commands, menus, notifications, history statuses, and errors. On 1.13+, search settings for `history`, `undo`, `更新历史`, and `撤回`; on older versions, check the settings button. After changing language, known plugin failures in existing history should follow the UI language while external messages and snapshots remain unchanged.
 
 ## Possible future improvements
 

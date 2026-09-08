@@ -1,28 +1,33 @@
 import { Modal, Setting } from 'obsidian';
 import type BasePathUpdater from './main';
+import { formatError, formatOperationError, formatTimestamp, t } from './i18n';
 
+/** Presents localized history, snapshot changes, and undo controls. */
 export class HistoryModal extends Modal {
+  /** Binds the modal to the supplied plugin's history and undo actions. */
   constructor(private plugin: BasePathUpdater) {
     super(plugin.app);
   }
 
+  /** Renders the current history when the modal opens. */
   onOpen(): void {
     this.render();
   }
 
+  /** Rebuilds history controls and translates stored failures at display time. */
   private render(): void {
     this.contentEl.empty();
     this.contentEl.addClass('base-path-updater-history');
-    this.contentEl.createEl('h2', { text: 'Base 更新历史' });
+    this.contentEl.createEl('h2', { text: t('historyTitle') });
     this.contentEl.createEl('p', {
-      text: '撤回只恢复 Base 内容，不移动文件夹。文件如有后续修改，会跳过并说明原因。连续操作请从最新一条开始撤回。',
+      text: t('historyHelp'),
     });
     new Setting(this.contentEl).addButton((button) =>
-      button.setButtonText('刷新').onClick(() => this.render()),
+      button.setButtonText(t('refresh')).onClick(() => this.render()),
     );
     if (!this.plugin.data.operations.length) {
       this.contentEl.createEl('p', {
-        text: '暂无更新记录。移动或重命名被 Base 引用的文件夹后，记录会出现在这里。',
+        text: t('emptyHistory'),
         cls: 'base-path-updater-muted',
       });
     }
@@ -30,10 +35,10 @@ export class HistoryModal extends Modal {
       const card = this.contentEl.createDiv({ cls: 'base-path-updater-operation' });
       new Setting(card)
         .setName(`${operation.oldPath} → ${operation.newPath}`)
-        .setDesc(new Date(operation.timestamp).toLocaleString())
+        .setDesc(formatTimestamp(operation.timestamp))
         .addButton((button) =>
           button
-            .setButtonText('撤回 Base 修改')
+            .setButtonText(t('undoButton'))
             .setDisabled(!operation.files.some((file) => !file.undone))
             .onClick(async () => {
               button.setDisabled(true);
@@ -44,7 +49,7 @@ export class HistoryModal extends Modal {
       for (const file of operation.files) {
         const details = card.createEl('details');
         details.createEl('summary', {
-          text: `${file.path}${file.undone ? ' · 已撤回' : file.error ? ' · 需要检查' : ' · 已记录'}`,
+          text: `${file.path} · ${t(file.undone ? 'undone' : file.error ? 'needsReview' : 'recorded')}`,
         });
         for (const change of file.changes) {
           const line = details.createDiv({ cls: 'base-path-updater-change' });
@@ -52,18 +57,25 @@ export class HistoryModal extends Modal {
           line.createSpan({ text: ' → ' });
           line.createEl('code', { text: change.after });
         }
-        if (file.error) details.createEl('p', { text: file.error, cls: 'base-path-updater-error' });
+        if (file.error)
+          details.createEl('p', { text: formatError(file.error), cls: 'base-path-updater-error' });
       }
       if (operation.errors.length) {
         const errors = card.createEl('details');
-        errors.createEl('summary', { text: `处理时的异常（${operation.errors.length}）` });
+        errors.createEl('summary', {
+          text: t('operationErrors', { count: operation.errors.length }),
+        });
         operation.errors.forEach((error) =>
-          errors.createEl('p', { text: error, cls: 'base-path-updater-error' }),
+          errors.createEl('p', {
+            text: formatOperationError(error),
+            cls: 'base-path-updater-error',
+          }),
         );
       }
     }
   }
 
+  /** Releases the rendered history elements when the modal closes. */
   onClose(): void {
     this.contentEl.empty();
   }

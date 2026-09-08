@@ -1,4 +1,13 @@
-import { Menu, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder } from 'obsidian';
+import {
+  Menu,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  TFile,
+  TFolder,
+  type SettingDefinitionItem,
+} from 'obsidian';
 import { updateBase } from './base-document';
 import { movePath } from './expressions';
 import {
@@ -12,27 +21,35 @@ import {
   type Operation,
 } from './history';
 import { HistoryModal } from './ui';
+import { PluginError, serializeError } from './errors';
+import { formatError, HISTORY_SEARCH_TERMS, t, type MessageKey } from './i18n';
+import { runWrite, waitForWrites } from './write-coordinator';
 
+/** Tracks folder moves, journals Base updates, and provides conflict-safe undo. */
 export default class BasePathUpdater extends Plugin {
-  data: HistoryData = { version: 1, operations: [] };
+  data: HistoryData = { version: 2, operations: [] };
   private bases = new Set<TFile>();
   private queue: Promise<void> = Promise.resolve();
   private stopped = false;
   private ready = false;
   private storageFailed = false;
 
+  /** Loads history and registers localized entry points and vault event handlers. */
   async onload(): Promise<void> {
     try {
+      await waitForWrites(this.app);
+      if (this.stopped) return;
       this.data = readHistory(await this.loadData());
     } catch (error) {
       this.storageFailed = true;
-      this.report('无法读取历史，自动更新已暂停', error);
+      this.report('loadFailed', error);
     }
+    if (this.stopped) return;
     this.addRibbonIcon('folder-sync', 'Base Path Updater', (event) => {
       new Menu()
         .addItem((item) =>
           item
-            .setTitle('查看更新历史 / 撤回')
+            .setTitle(t('openHistory'))
             .setIcon('history')
             .onClick(() => this.openHistory()),
         )
@@ -40,7 +57,7 @@ export default class BasePathUpdater extends Plugin {
     });
     this.addCommand({
       id: 'open-history',
-      name: '查看更新历史 / 撤回',
+      name: t('openHistory'),
       callback: () => this.openHistory(),
     });
     this.addSettingTab(new HistorySettingTab(this));
@@ -109,39 +126,51 @@ export default class BasePathUpdater extends Plugin {
     });
   }
 
+  /** Stops queued work and releases the cached file references. */
   onunload(): void {
     this.stopped = true;
     this.bases.clear();
   }
 
+  /** Opens the history modal in the current app language. */
   openHistory(): void {
     new HistoryModal(this).open();
   }
 
-  private report(message: string, error: unknown): void {
-    console.error(`[Base Path Updater] ${message}`, error);
-    new Notice(`Base Path Updater：${message}`);
+  /** Displays the supplied message key and logs the caught error with translated details. */
+  private report(key: MessageKey, error: unknown): void {
+    if (this.stopped) return;
+    console.error(`[Base Path Updater] ${t(key)} ${formatError(serializeError(error))}`, error);
+    new Notice(`Base Path Updater: ${t(key)}`);
   }
 
+  /** Serializes the supplied async task and returns its completion promise, reporting failures. */
   private enqueue(task: () => Promise<void>): Promise<void> {
     this.queue = this.queue
       .then(async () => {
         if (!this.stopped && !this.storageFailed) await task();
       })
-      .catch((error) => this.report('操作未完成，请查看历史记录及控制台', error));
+      .catch((error) => this.report('operationFailed', error));
     return this.queue;
   }
 
-  private async persist(): Promise<void> {
+  /** Saves the journal if active, returning false after unload and pausing work on storage failure. */
+  private async persist(): Promise<boolean> {
+    if (this.stopped || this.storageFailed) return false;
     try {
-      await this.saveData(this.data);
+      return await runWrite(this.app, async () => {
+        if (this.stopped || this.storageFailed) return false;
+        await this.saveData(this.data);
+        return !this.stopped;
+      });
     } catch (error) {
       this.storageFailed = true;
-      this.report('历史保存失败，后续自动更新已暂停；请检查存储后重新启用插件', error);
+      this.report('saveFailed', error);
       throw error;
     }
   }
 
+  /** Updates candidate Bases for the supplied folder move and persists snapshots and failure codes. */
   private async updateFolder(oldPath: string, newPath: string, candidates: TFile[]): Promise<void> {
     const operation: Operation = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -158,88 +187,134 @@ export default class BasePathUpdater extends Plugin {
       let entry: FileChange | undefined;
       try {
         const before = await this.app.vault.read(file);
+        if (this.stopped) return;
         const update = updateBase(before, oldPath, newPath);
         if (!update.changes.length) continue;
-        if (!this.data.operations.includes(operation)) {
-          this.data.operations.unshift(operation);
-          this.data.operations.splice(MAX_OPERATIONS);
-        }
-        entry = {
+        const candidate: FileChange = {
           path: file.path,
           before,
           after: update.text,
           changes: update.changes,
           undone: false,
         };
+        // Check the active operation alone before changing any existing history.
+        const proposed = { ...operation, files: [...operation.files, candidate] };
+        if (historySize({ version: 2, operations: [proposed] }) > MAX_HISTORY_BYTES) {
+          throw new PluginError({
+            code: 'historyLimit',
+            params: { limitMiB: MAX_HISTORY_BYTES / (1024 * 1024) },
+          });
+        }
+        entry = candidate;
         operation.files.push(entry);
-        // Keep the active operation intact. Refuse a write that cannot be journaled.
+        if (!this.data.operations.includes(operation)) {
+          this.data.operations.unshift(operation);
+          this.data.operations.splice(MAX_OPERATIONS);
+        }
         while (historySize(this.data) > MAX_HISTORY_BYTES && this.data.operations.length > 1) {
           this.data.operations.pop();
         }
-        if (historySize(this.data) > MAX_HISTORY_BYTES) {
-          operation.files.pop();
-          entry = undefined;
-          throw new Error('本次操作超过 5 MiB 历史容量，未修改此文件');
-        }
         // Write-ahead snapshot survives a crash between the vault write and status save.
-        await this.persist();
-        if (this.stopped) break;
-        await this.app.vault.process(file, (current) => {
-          if (current !== before) throw new Error('文件在更新期间发生变化，已跳过');
-          return update.text;
+        if (!(await this.persist()) || this.stopped) return;
+        await runWrite(this.app, async () => {
+          if (this.stopped) return;
+          await this.app.vault.process(file, (current) => {
+            if (this.stopped) return current;
+            if (current !== before) throw new PluginError({ code: 'concurrentEdit' });
+            return update.text;
+          });
         });
+        if (this.stopped) return;
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (entry) entry.error = message;
-        operation.errors.push(`${file.path}：${message}`);
+        if (this.stopped) return;
+        const detail = serializeError(error);
+        if (entry) entry.error = detail;
+        operation.errors.push({ path: file.path, error: detail });
       }
     }
-    if (this.storageFailed) return;
+    if (this.stopped || this.storageFailed) return;
+    // A rejected oversized operation must not consume an undo-history slot.
+    if (
+      !operation.files.length &&
+      operation.errors.length &&
+      operation.errors.every((entry) => entry.error.code === 'historyLimit')
+    ) {
+      new Notice(t('historyCapacitySkipped', { count: operation.errors.length }));
+      return;
+    }
     if (operation.files.length || operation.errors.length) {
       if (!this.data.operations.includes(operation)) this.data.operations.unshift(operation);
       this.data.operations.splice(MAX_OPERATIONS);
-      await this.persist();
+      if (!(await this.persist()) || this.stopped) return;
       new Notice(
-        `Base Path Updater：处理 ${operation.files.length} 个 Base${operation.errors.length ? `，${operation.errors.length} 项异常` : ''}。可在更新历史中查看 / 撤回。`,
+        `Base Path Updater: ${t(operation.errors.length ? 'updateWithErrors' : 'updateComplete', {
+          count: operation.files.length,
+          errors: operation.errors.length,
+        })}`,
       );
     }
   }
 
+  /** Restores matching snapshots for the supplied operation and returns the queued completion promise. */
   undo(operation: Operation): Promise<void> {
     return this.enqueue(async () => {
       if (!this.data.operations.includes(operation)) return;
       for (const entry of operation.files) {
-        if (this.stopped || entry.undone) continue;
+        if (this.stopped) return;
+        if (entry.undone) continue;
         try {
           const file = this.app.vault.getAbstractFileByPath(entry.path);
           if (entry.missing || !(file instanceof TFile) || file.extension !== 'base') {
-            throw new Error('原 Base 已删除或不再是 .base 文件，无法撤回');
+            throw new PluginError({ code: 'missingBase' });
           }
-          await this.app.vault.process(file, (current) => undoContent(current, entry));
+          await runWrite(this.app, async () => {
+            if (this.stopped) return;
+            await this.app.vault.process(file, (current) =>
+              this.stopped ? current : undoContent(current, entry),
+            );
+          });
+          if (this.stopped) return;
           entry.undone = true;
           delete entry.error;
         } catch (error) {
-          entry.error = error instanceof Error ? error.message : String(error);
+          if (this.stopped) return;
+          entry.error = serializeError(error);
         }
-        await this.persist();
+        if (!(await this.persist()) || this.stopped) return;
       }
-      new Notice('撤回检查完成。冲突或缺失的文件会保留原样，请查看历史详情。');
+      new Notice(t('undoComplete'));
     });
   }
 }
 
+/** Exposes searchable history access, with legacy settings rendering as a fallback. */
 class HistorySettingTab extends PluginSettingTab {
+  /** Binds the settings tab to the supplied plugin instance. */
   constructor(private updater: BasePathUpdater) {
     super(updater.app, updater);
   }
 
+  /** Returns searchable history metadata and its action for Obsidian 1.13+. */
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: t('historyName'),
+        desc: t('historyDescription'),
+        aliases: [...HISTORY_SEARCH_TERMS],
+        // Open history only when activated, never during search indexing.
+        action: () => this.updater.openHistory(),
+      },
+    ];
+  }
+
+  /** Renders the history button on Obsidian versions older than 1.13. */
   display(): void {
     this.containerEl.empty();
     new Setting(this.containerEl)
-      .setName('更新历史')
-      .setDesc('查看路径变化并撤回。最多保留最近 30 次操作，快照容量约 5 MiB。')
+      .setName(t('historyName'))
+      .setDesc(t('historyDescription'))
       .addButton((button) =>
-        button.setButtonText('查看历史 / 撤回').onClick(() => this.updater.openHistory()),
+        button.setButtonText(t('historyButton')).onClick(() => this.updater.openHistory()),
       );
   }
 }

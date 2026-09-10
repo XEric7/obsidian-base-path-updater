@@ -1,6 +1,6 @@
-// Keep outstanding writes visible even when Obsidian reloads the plugin module.
+// Use the fixed main window so module reloads and focus changes share outstanding writes.
 const registryKey = Symbol.for('base-path-updater.pending-writes');
-const host = globalThis as typeof globalThis & {
+const host = window as Window & {
   [registryKey]?: WeakMap<object, Promise<void>>;
 };
 const pendingWrites = (host[registryKey] ??= new WeakMap<object, Promise<void>>());

@@ -1,6 +1,11 @@
-import { expect, it, vi } from 'vitest';
+import { afterAll, expect, it, vi } from 'vitest';
 
-it('shares outstanding writes across module reloads and lets later writes proceed after failure', async () => {
+// Restore window globals after the coordinator's reload and focus-change regression test.
+afterAll(() => vi.unstubAllGlobals());
+
+/** Verifies reloads and focus changes preserve write order and recovery after failure. */
+it('shares writes across reloads and focus changes and proceeds after failure', async () => {
+  vi.stubGlobal('activeWindow', window);
   const app = {};
   const first = await import('../src/write-coordinator');
   let finish!: () => void;
@@ -12,6 +17,7 @@ it('shares outstanding writes across module reloads and lets later writes procee
     throw new Error('Disk full');
   });
   const rejected = expect(write).rejects.toThrow('Disk full');
+  vi.stubGlobal('activeWindow', {});
   vi.resetModules();
   const reloaded = await import('../src/write-coordinator');
   const next = vi.fn(async () => 42);

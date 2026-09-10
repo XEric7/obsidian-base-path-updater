@@ -123,3 +123,26 @@ it('rejects corrupt operation errors and null entries before migration', () => {
     }),
   ).toThrow('historyCorrupt');
 });
+
+/** Checks both journal versions against valid and malformed path-change entries. */
+it.each([1, 2] as const)('validates path-change objects in v%i history', (version) => {
+  const data = version === 1 ? legacyHistory() : readHistory(legacyHistory());
+  const file = data.operations[0]!.files[0]!;
+  const valid = { before: 'Old', after: 'New' };
+  file.changes = [valid];
+  expect(readHistory(data).operations[0]!.files[0]!.changes).toEqual([valid]);
+
+  for (const invalid of [
+    null,
+    'text',
+    42,
+    {},
+    { before: 'Old' },
+    { before: 1, after: 'New' },
+    { before: 'Old', after: null },
+    Object.assign([], valid),
+  ]) {
+    file.changes = [invalid as never];
+    expect(() => readHistory(data)).toThrow('historyCorrupt');
+  }
+});

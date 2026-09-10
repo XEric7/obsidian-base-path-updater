@@ -94,7 +94,10 @@ export function readHistory(value: unknown): HistoryData {
           !(data.version === 1 ? typeof file.error === 'string' : isStoredError(file.error))) ||
         !Array.isArray(file.changes) ||
         !file.changes.every(
-          (change) => typeof change?.before === 'string' && typeof change?.after === 'string',
+          (change: unknown) =>
+            isRecord(change) &&
+            typeof change.before === 'string' &&
+            typeof change.after === 'string',
         )
       ) {
         throw new PluginError({ code: 'historyCorrupt' });

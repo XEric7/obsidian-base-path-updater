@@ -51,6 +51,7 @@ const BENIGN_SECTIONS = new Set([
 export default class BasePathUpdater extends Plugin {
   data: HistoryData = { version: 2, operations: [] };
   private bases = new Set<TFile>();
+  private pendingInspections = new Set<Promise<void>>();
   private queue: Promise<void> = Promise.resolve();
   private mdBackfill: Promise<void> = Promise.resolve();
   private stopped = false;
@@ -88,20 +89,13 @@ export default class BasePathUpdater extends Plugin {
       this.app.vault.on('create', (file) => {
         if (!this.ready || !(file instanceof TFile)) return;
         if (file.extension === 'base') this.bases.add(file);
-        else if (file.extension === 'md' && this.updateMarkdownBases)
-          void this.inspectMarkdown(file, false);
+        else if (file.extension === 'md') this.watchMarkdown(file);
       }),
     );
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
-        if (
-          this.ready &&
-          this.updateMarkdownBases &&
-          file instanceof TFile &&
-          file.extension === 'md'
-        ) {
-          void this.inspectMarkdown(file, false);
-        }
+        if (this.ready && file instanceof TFile && file.extension === 'md')
+          this.watchMarkdown(file);
       }),
     );
     this.registerEvent(
@@ -130,8 +124,7 @@ export default class BasePathUpdater extends Plugin {
         const newPath = file.path;
         if (file instanceof TFile) {
           if (file.extension === 'base') this.bases.add(file);
-          else if (file.extension === 'md' && this.updateMarkdownBases)
-            void this.inspectMarkdown(file, false);
+          else if (file.extension === 'md' && this.updateMarkdownBases) this.watchMarkdown(file);
           else this.bases.delete(file);
         }
         if (!this.ready) return;
@@ -155,7 +148,10 @@ export default class BasePathUpdater extends Plugin {
             }
           }
           if (changed) await this.persist();
-          if (folder) await this.updateFolder(oldPath, newPath, [...this.bases]);
+          if (!folder || this.stopped) return;
+          await this.waitForInspections();
+          if (this.stopped) return;
+          await this.updateFolder(oldPath, newPath, [...this.bases]);
         });
       }),
     );
@@ -268,6 +264,20 @@ export default class BasePathUpdater extends Plugin {
     return (cached.sections ?? []).some(
       (section) => section.type === 'code' || !BENIGN_SECTIONS.has(section.type),
     );
+  }
+
+  /** Tracks one Markdown fence inspection so a folder move can wait for it. */
+  private watchMarkdown(file: TFile): void {
+    if (!this.ready || !this.updateMarkdownBases || this.stopped || file.extension !== 'md') return;
+    const task = this.inspectMarkdown(file, false).finally(() => {
+      this.pendingInspections.delete(task);
+    });
+    this.pendingInspections.add(task);
+  }
+
+  /** Waits until Markdown inspections started before this call, and any they queue, have finished. */
+  private async waitForInspections(): Promise<void> {
+    while (this.pendingInspections.size > 0) await Promise.all([...this.pendingInspections]);
   }
 
   /** Adds or removes a Markdown file from the candidate set using a cheap fence probe. */

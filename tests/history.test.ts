@@ -227,6 +227,17 @@ it('does not overwrite a fence that no longer matches either snapshot', () => {
   expect(() => undoContent('# rewritten\n', change)).toThrow('undoConflict');
 });
 
+it('reports a conflict when an identical fence snapshot matches more than one place', () => {
+  const after = '```base\nfilters: file.inFolder("New")\n```';
+  const change: FileChange = {
+    path: 'note.md',
+    regions: [{ before: after.replace('New', 'Old'), after }],
+    changes: [],
+    undone: false,
+  };
+  expect(() => undoContent(`${after}\n\n${after}\n`, change)).toThrow('undoConflict');
+});
+
 it.each([1, 2] as const)('validates path-change objects in v%i history', (version) => {
   const data = version === 1 ? legacyHistory() : readHistory(legacyHistory());
   const file = data.operations[0]!.files[0]!;

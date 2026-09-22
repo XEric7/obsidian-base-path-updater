@@ -13,6 +13,9 @@ import {
 export interface SnapshotRegion {
   before: string;
   after: string;
+  /** Nearby text that identifies this fence when `after` also appears elsewhere. */
+  prefix?: string;
+  suffix?: string;
 }
 
 /** Stores a Base snapshot pair, path changes, and optional structured failure details. */
@@ -102,7 +105,7 @@ export function readHistory(value: unknown): HistoryData {
         !Array.isArray(file.changes) ||
         !file.changes.every(isSnapshotPair) ||
         (file.regions !== undefined &&
-          !(Array.isArray(file.regions) && file.regions.every(isSnapshotPair))) ||
+          !(Array.isArray(file.regions) && file.regions.every(isRegion))) ||
         !hasUndoSnapshot(file)
       ) {
         throw new PluginError({ code: 'historyCorrupt' });
@@ -141,8 +144,19 @@ function hasUndoSnapshot(file: Record<string, unknown>): boolean {
 }
 
 /** Returns whether a value is a before/after text pair rather than an array or primitive. */
-function isSnapshotPair(value: unknown): value is SnapshotRegion {
+function isSnapshotPair(value: unknown): value is { before: string; after: string } {
   return isRecord(value) && typeof value.before === 'string' && typeof value.after === 'string';
+}
+
+/** Returns whether a fence snapshot has optional string context and no other context types. */
+function isRegion(value: unknown): value is SnapshotRegion {
+  return (
+    isRecord(value) &&
+    typeof value.before === 'string' &&
+    typeof value.after === 'string' &&
+    (value.prefix === undefined || typeof value.prefix === 'string') &&
+    (value.suffix === undefined || typeof value.suffix === 'string')
+  );
 }
 
 /** Applies a safe undo and reports whether some recorded regions could not be matched. */
@@ -168,22 +182,72 @@ function undoRegions(
   current: string,
   regions: SnapshotRegion[],
 ): { text: string; conflict: boolean } {
-  let text = current;
-  let applied = false;
+  const hits: { index: number; region: SnapshotRegion }[] = [];
   let conflict = false;
-  const ordered = regions
-    .map((region, index) => ({ region, index }))
-    .sort((a, b) => b.region.after.length - a.region.after.length || a.index - b.index);
-  for (const { region } of ordered) {
-    const index = text.indexOf(region.after);
-    if (index !== -1) {
-      text = text.slice(0, index) + region.before + text.slice(index + region.after.length);
-      applied = true;
-      continue;
-    }
-    if (text.includes(region.before)) continue;
-    conflict = true;
+  for (const region of regions) {
+    const located = locateRegion(current, region);
+    if (located === 'ambiguous') conflict = true;
+    else if (located === 'missing') {
+      if (!alreadyRestored(current, region)) conflict = true;
+    } else hits.push({ index: located, region });
   }
-  if (applied || !conflict) return { text, conflict };
+  const applicable = hits.filter(
+    (hit, index) => !hits.some((other, otherIndex) => otherIndex !== index && overlaps(hit, other)),
+  );
+  if (applicable.length !== hits.length) conflict = true;
+  let text = current;
+  for (const hit of applicable.sort((a, b) => b.index - a.index)) {
+    text =
+      text.slice(0, hit.index) +
+      hit.region.before +
+      text.slice(hit.index + hit.region.after.length);
+  }
+  if (applicable.length || !conflict) return { text, conflict };
   return { text: current, conflict: true };
+}
+
+/** Finds the only fence matching this snapshot, or reports that the match is missing or ambiguous. */
+function locateRegion(text: string, region: SnapshotRegion): number | 'missing' | 'ambiguous' {
+  const prefix = region.prefix ?? '';
+  const suffix = region.suffix ?? '';
+  const withContext = occurrences(text, prefix + region.after + suffix);
+  if (withContext === 1) return text.indexOf(prefix + region.after + suffix) + prefix.length;
+  if (withContext > 1) return 'ambiguous';
+  const bare = occurrences(text, region.after);
+  if ((prefix || suffix) && bare === 1) return text.indexOf(region.after);
+  if (bare > 1) return 'ambiguous';
+  return 'missing';
+}
+
+/** Returns whether this fence is already back to its recorded original text. */
+function alreadyRestored(text: string, region: SnapshotRegion): boolean {
+  const prefix = region.prefix ?? '';
+  const suffix = region.suffix ?? '';
+  if ((prefix || suffix) && occurrences(text, prefix + region.before + suffix) === 1) return true;
+  return occurrences(text, region.before) > 0 && occurrences(text, region.after) === 0;
+}
+
+/** Returns whether two located fences cover any of the same source characters. */
+function overlaps(
+  left: { index: number; region: SnapshotRegion },
+  right: { index: number; region: SnapshotRegion },
+): boolean {
+  return (
+    left.index < right.index + right.region.after.length &&
+    right.index < left.index + left.region.after.length
+  );
+}
+
+/** Counts non-overlapping occurrences of needle in text. */
+function occurrences(text: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index <= text.length) {
+    const found = text.indexOf(needle, index);
+    if (found === -1) return count;
+    count++;
+    index = found + needle.length;
+  }
+  return count;
 }

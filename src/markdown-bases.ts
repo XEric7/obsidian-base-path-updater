@@ -51,7 +51,12 @@ export function updateMarkdownBases(
         source.slice(fence.start, fence.bodyStart) +
         result.text +
         source.slice(fence.bodyEnd, fence.end);
-      edits.push({ start: fence.start, end: fence.end, value: after, region: { before, after } });
+      edits.push({
+        start: fence.start,
+        end: fence.end,
+        value: after,
+        region: { before, after, ...fenceContext(source, fence.start, fence.end, after) },
+      });
       changes.push(...result.changes);
     } catch (error) {
       errors.push(serializeError(error));
@@ -72,22 +77,41 @@ export function updateMarkdownBases(
   };
 }
 
-/** Locates complete `base` fences, skipping examples wrapped in a longer outer fence. */
+/** Locates complete `base` fences, skipping examples wrapped in a longer outer fence or HTML comment. */
 export function findBaseFences(
   source: string,
 ): { start: number; bodyStart: number; bodyEnd: number; end: number }[] {
   const fences: { start: number; bodyStart: number; bodyEnd: number; end: number }[] = [];
   let open: OpenFence | undefined;
+  let comment = false;
+  let rawClose: string | undefined;
   for (const line of iterateLines(source)) {
+    if (comment || rawClose) {
+      if (comment && line.content.includes('-->')) comment = false;
+      if (rawClose && line.content.toLowerCase().includes(rawClose)) rawClose = undefined;
+      continue;
+    }
     if (!open) {
       const opening = openingFence(line.content);
-      if (!opening) continue;
-      open = {
-        start: line.start,
-        bodyStart: line.end,
-        marker: opening.marker,
-        base: opening.language.toLowerCase() === 'base',
-      };
+      if (opening) {
+        open = {
+          start: line.start,
+          bodyStart: line.end,
+          marker: opening.marker,
+          base: opening.language.toLowerCase() === 'base',
+        };
+        continue;
+      }
+      const commentAt = line.content.indexOf('<!--');
+      if (commentAt !== -1 && !line.content.includes('-->', commentAt + 4)) {
+        comment = true;
+        continue;
+      }
+      const raw = /^ {0,3}<(script|pre|style|textarea)(?=[\s>/])/i.exec(line.content);
+      if (raw && raw[1]) {
+        rawClose = `</${raw[1].toLowerCase()}>`;
+        if (line.content.toLowerCase().includes(rawClose)) rawClose = undefined;
+      }
       continue;
     }
     if (!isClosingFence(line.content, open.marker)) continue;
@@ -101,7 +125,7 @@ export function findBaseFences(
     }
     open = undefined;
   }
-  if (open?.base) {
+  if (open?.base && !comment && !rawClose) {
     fences.push({
       start: open.start,
       bodyStart: open.bodyStart,
@@ -110,6 +134,50 @@ export function findBaseFences(
     });
   }
   return fences;
+}
+
+/** Returns the shortest nearby text that makes this updated fence unique in the source. */
+function fenceContext(
+  source: string,
+  start: number,
+  end: number,
+  after: string,
+): { prefix?: string; suffix?: string } {
+  const beforeText = source.slice(0, start);
+  const afterText = source.slice(end);
+  let prefixLength = 0;
+  let suffixLength = 0;
+  while (
+    occurrences(
+      source,
+      beforeText.slice(beforeText.length - prefixLength) + after + afterText.slice(0, suffixLength),
+    ) !== 1
+  ) {
+    if (prefixLength >= beforeText.length && suffixLength >= afterText.length) break;
+    if (prefixLength < beforeText.length)
+      prefixLength = Math.min(beforeText.length, prefixLength + 32);
+    else suffixLength = Math.min(afterText.length, suffixLength + 32);
+  }
+  const prefix = beforeText.slice(beforeText.length - prefixLength);
+  const suffix = afterText.slice(0, suffixLength);
+  return {
+    ...(prefix ? { prefix } : {}),
+    ...(suffix ? { suffix } : {}),
+  };
+}
+
+/** Counts non-overlapping occurrences of needle in text. */
+function occurrences(text: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index <= text.length) {
+    const found = text.indexOf(needle, index);
+    if (found === -1) return count;
+    count++;
+    index = found + needle.length;
+  }
+  return count;
 }
 
 function iterateLines(source: string): Line[] {

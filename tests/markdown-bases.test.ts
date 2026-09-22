@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { findBaseFences, mayContainBaseFence, updateMarkdownBases } from '../src/markdown-bases';
+import { undoContent } from '../src/history';
 
 const note = (body: string, marker = '```') =>
   `# Heading\n\n${marker}base\n${body}\n${marker}\n\nTrailing text.\n`;
@@ -73,5 +74,39 @@ describe('Markdown base fences', () => {
   it('does not rewrite notes that only mention the old path outside a Base fence', () => {
     const source = 'Old path lives here.\n```js\nfile.inFolder("Old")\n```\n';
     expect(updateMarkdownBases(source, 'Old', 'New').text).toBe(source);
+  });
+
+  it('does not rewrite a Base fence inside an HTML comment or raw HTML block', () => {
+    const commented = '<!--\n```base\nfilters: file.inFolder("Old")\n```\n-->\n';
+    const script = '<script>\n```base\nfilters: file.inFolder("Old")\n```\n</script>\n';
+    const active = '```base\nfilters: file.inFolder("Old")\n```\n';
+    expect(updateMarkdownBases(commented + '\n' + active, 'Old', 'New').text).toBe(
+      commented + '\n```base\nfilters: "file.inFolder(\\"New\\")"\n```\n',
+    );
+    expect(updateMarkdownBases(script, 'Old', 'New').text).toBe(script);
+    expect(findBaseFences(commented)).toHaveLength(0);
+  });
+
+  it('restores the fence that changed when another fence already has the new text', () => {
+    const source = [
+      '```base',
+      'filters: file.inFolder("New")',
+      '```',
+      '',
+      '```base',
+      'filters: file.inFolder("Old")',
+      '```',
+      '',
+    ].join('\n');
+    const updated = updateMarkdownBases(source, 'Old', 'New');
+    expect(updated.regions).toHaveLength(1);
+    expect(updated.regions[0]!.prefix).toBeTruthy();
+    const restored = undoContent(updated.text, {
+      path: 'note.md',
+      regions: updated.regions,
+      changes: updated.changes,
+      undone: false,
+    });
+    expect(restored).toBe(source);
   });
 });

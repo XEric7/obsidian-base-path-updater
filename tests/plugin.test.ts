@@ -465,6 +465,26 @@ describe('plugin lifecycle and safe writes', () => {
     expect(h.contents.get(file)).toBe('no fence');
   });
 
+  it('waits for an in-flight Markdown inspection before updating a folder', async () => {
+    const h = await setup({ 'note.md': 'plain' });
+    await h.plugin.setUpdateMarkdownBases(true);
+    const file = [...h.contents.keys()][0]!;
+    let release!: (value: string) => void;
+    const pending = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    h.vault.cachedRead.mockImplementationOnce(() => pending);
+    const fenced = '```base\nfilters: file.inFolder("Old")\n```\n';
+    h.contents.set(file, fenced);
+    h.listeners.get('modify')!(file);
+    h.folderMove('Old', 'New');
+    await Promise.resolve();
+    expect(h.vault.process).not.toHaveBeenCalled();
+    release(fenced);
+    await h.flush();
+    expect(h.contents.get(file)).toContain('inFolder(\\"New\\")');
+  });
+
   it('skips Markdown notes whose metadata cache has no code section', async () => {
     const h = await setup(
       {

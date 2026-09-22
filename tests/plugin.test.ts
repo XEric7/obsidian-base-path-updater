@@ -22,6 +22,7 @@ function deferred<T>() {
 async function setup(
   initial: Record<string, string> = { 'view.base': 'filters: file.inFolder("Old")\n' },
   persisted: unknown = null,
+  extras: { getFileCache?: (file: TFile) => { sections?: { type: string }[] } | null } = {},
 ) {
   const listeners = new Map<string, (...args: unknown[]) => void>();
   const contents = new Map<TFile, string>();
@@ -33,9 +34,11 @@ async function setup(
   const vault = {
     on: (name: string, callback: (...args: unknown[]) => void) => listeners.set(name, callback),
     getFiles: () => [...contents.keys()],
+    getMarkdownFiles: () => [...contents.keys()].filter((file) => file.extension === 'md'),
     getAbstractFileByPath: (path: string) =>
       [...contents.keys()].find((file) => file.path === path),
     read: vi.fn(async (file: TFile) => contents.get(file)!),
+    cachedRead: vi.fn(async (file: TFile) => contents.get(file)!),
     process: vi.fn(async (file: TFile, callback: (content: string) => string) => {
       const result = callback(contents.get(file)!);
       contents.set(file, result);
@@ -49,9 +52,11 @@ async function setup(
   plugin.app = {
     vault,
     workspace: { onLayoutReady: (callback: () => void) => callback() },
+    ...(extras.getFileCache ? { metadataCache: { getFileCache: extras.getFileCache } } : {}),
   } as never;
   plugin.persisted = persisted;
   await plugin.onload();
+  await (plugin as unknown as { mdBackfill: Promise<void> }).mdBackfill;
   const flush = () => (plugin as unknown as { queue: Promise<void> }).queue;
   const folderMove = (oldPath: string, newPath: string) => {
     for (const file of contents.keys()) {
@@ -299,10 +304,11 @@ describe('plugin lifecycle and safe writes', () => {
     },
   );
 
-  it('does no reads on startup or edits and only inspects cached Bases on folder rename', async () => {
+  it('does not parse Bases on startup and only rewrites them on folder rename', async () => {
     const h = await setup({ 'view.base': 'filters: file.inFolder("Old")', 'note.md': 'Old' });
     expect(h.vault.read).not.toHaveBeenCalled();
-    expect(h.listeners.has('modify')).toBe(false);
+    expect(h.vault.cachedRead).toHaveBeenCalledTimes(1);
+    expect(h.listeners.has('modify')).toBe(true);
     h.folderMove('Old', 'New');
     await h.flush();
     expect(h.vault.read).toHaveBeenCalledTimes(1);
@@ -390,7 +396,7 @@ describe('plugin lifecycle and safe writes', () => {
     h.contents.delete(file);
     const replacement = new TFile();
     replacement.path = file.path;
-    h.contents.set(replacement, h.plugin.data.operations[0]!.files[0]!.after);
+    h.contents.set(replacement, h.plugin.data.operations[0]!.files[0]!.after!);
     await h.plugin.undo(h.plugin.data.operations[0]!);
     expect(h.plugin.data.operations[0]!.files[0]!.error).toEqual({ code: 'missingBase' });
   });
@@ -401,5 +407,68 @@ describe('plugin lifecycle and safe writes', () => {
     h.plugin.onunload();
     await h.flush();
     expect(h.vault.process).not.toHaveBeenCalled();
+  });
+
+  it('updates embedded Markdown Bases and undoes fences without reverting other note edits', async () => {
+    const source = '# Title\n```base\nfilters: file.inFolder("Old")\n```\nbody\n';
+    const h = await setup({ 'note.md': source });
+    h.folderMove('Old', 'New');
+    await h.flush();
+    const file = [...h.contents.keys()][0]!;
+    expect(h.contents.get(file)).toContain('inFolder(\\"New\\")');
+    expect(h.contents.get(file)).toContain('# Title');
+    const recorded = h.plugin.data.operations[0]!.files[0]!;
+    expect(recorded.regions).toHaveLength(1);
+    expect(recorded.before).toBeUndefined();
+    expect(recorded.after).toBeUndefined();
+    expect(recorded.regions![0]!.before).toContain('```base');
+    expect(recorded.regions![0]!.before).not.toContain('# Title');
+    h.contents.set(file, h.contents.get(file)! + '# extra\n');
+    await h.plugin.undo(h.plugin.data.operations[0]!);
+    expect(h.contents.get(file)).toContain('file.inFolder("Old")');
+    expect(h.contents.get(file)).toContain('# extra');
+    expect(h.plugin.data.operations[0]!.files[0]!.undone).toBe(true);
+  });
+
+  it('adds and removes Markdown candidates on modify without rewriting paths', async () => {
+    const h = await setup({ 'note.md': 'plain' });
+    const file = [...h.contents.keys()][0]!;
+    h.folderMove('Old', 'New');
+    await h.flush();
+    expect(h.vault.process).not.toHaveBeenCalled();
+    h.contents.set(file, '```base\nfilters: file.inFolder("New")\n```\n');
+    h.listeners.get('modify')!(file);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    h.folderMove('New', 'Final');
+    await h.flush();
+    expect(h.contents.get(file)).toContain('inFolder(\\"Final\\")');
+    h.contents.set(file, 'no fence');
+    h.listeners.get('modify')!(file);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    h.folderMove('Final', 'Gone');
+    await h.flush();
+    expect(h.contents.get(file)).toBe('no fence');
+  });
+
+  it('skips Markdown notes whose metadata cache has no code section', async () => {
+    const h = await setup(
+      {
+        'plain.md': '```base\nfilters: file.inFolder("Old")\n```\n',
+        'note.md': '```base\nfilters: file.inFolder("Old")\n```\n',
+      },
+      null,
+      {
+        getFileCache: (file) =>
+          file.path === 'plain.md'
+            ? { sections: [{ type: 'paragraph' }] }
+            : { sections: [{ type: 'code' }] },
+      },
+    );
+    expect(h.vault.cachedRead.mock.calls.map(([file]) => file.path)).toEqual(['note.md']);
+    h.folderMove('Old', 'New');
+    await h.flush();
+    const byPath = Object.fromEntries([...h.contents].map(([file, text]) => [file.path, text]));
+    expect(byPath['plain.md']).toContain('file.inFolder("Old")');
+    expect(byPath['note.md']).toContain('inFolder(\\"New\\")');
   });
 });

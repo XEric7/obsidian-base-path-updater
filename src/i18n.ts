@@ -9,7 +9,7 @@ const en = {
   historyButton: 'View history / undo',
   historyTitle: 'Base update history',
   historyHelp:
-    'Undo restores Base content only; it does not move folders. Files with later edits are skipped with an explanation. Undo consecutive operations from newest to oldest.',
+    'Undo restores Base content only; it does not move folders. Embedded Bases in Markdown are restored by code block, so other note edits are kept. Files with later Base edits are skipped with an explanation. Undo consecutive operations from newest to oldest.',
   refresh: 'Refresh',
   emptyHistory:
     'No updates yet. Records appear after you move or rename a folder referenced by a Base.',
@@ -34,7 +34,8 @@ const en = {
   undoConflict:
     'The file has later edits and was not overwritten. Undo newer operations first or inspect it manually.',
   concurrentEdit: 'The file changed during the update; skipped.',
-  missingBase: 'The original Base was deleted or is no longer a .base file; cannot undo.',
+  missingBase:
+    'The original Base was deleted or is no longer a .base file or Markdown note; cannot undo.',
   historyLimit:
     'This operation exceeds the {limitMiB} MiB history limit. This file was not modified.',
   historyCapacitySkipped:
@@ -52,7 +53,7 @@ const zh: Record<MessageKey, string> = {
   historyButton: '查看历史 / 撤回',
   historyTitle: 'Base 更新历史',
   historyHelp:
-    '撤回只恢复 Base 内容，不移动文件夹。文件如有后续修改，会跳过并说明原因。连续操作请从最新一条开始撤回。',
+    '撤回只恢复 Base 内容，不移动文件夹。Markdown 中的嵌入 Base 按代码块恢复，笔记其余修改会保留。Base 本身被后续修改时会跳过并说明原因。连续操作请从最新一条开始撤回。',
   refresh: '刷新',
   emptyHistory: '暂无更新记录。移动或重命名被 Base 引用的文件夹后，记录会出现在这里。',
   undoButton: '撤回 Base 修改',
@@ -72,7 +73,7 @@ const zh: Record<MessageKey, string> = {
   historyCorrupt: '历史记录损坏',
   undoConflict: '文件已被后续修改，未覆盖；请先撤回较新的操作或手动检查',
   concurrentEdit: '文件在更新期间发生变化，已跳过',
-  missingBase: '原 Base 已删除或不再是 .base 文件，无法撤回',
+  missingBase: '原 Base 已删除或不再是 .base 文件或 Markdown 笔记，无法撤回',
   historyLimit: '本次操作超过 {limitMiB} MiB 历史容量，未修改此文件',
   historyCapacitySkipped: '已跳过 {count} 个 Base：快照超过历史容量限制。已有撤回历史保持不变。',
   external: '{message}',

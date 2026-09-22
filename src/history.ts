@@ -41,6 +41,8 @@ export interface Operation {
 export interface HistoryData {
   version: 2;
   operations: Operation[];
+  /** When true, folder moves also update `base` fences inside Markdown notes. */
+  updateMarkdownBases?: boolean;
 }
 
 /** Legacy journal layout, used only after validation during the v1-to-v2 conversion. */
@@ -109,19 +111,26 @@ export function readHistory(value: unknown): HistoryData {
   }
   // Migration stays in memory until the next normal journal save succeeds.
   const result = structuredClone(data) as unknown as HistoryData | LegacyHistoryData;
-  if (result.version === 2) return result;
-  return {
-    ...result,
-    version: 2,
-    operations: result.operations.map((operation) => ({
-      ...operation,
-      errors: operation.errors.map(migrateLegacyOperationError),
-      files: operation.files.map((file) => {
-        const { error, ...snapshot } = file;
-        return error === undefined ? snapshot : { ...snapshot, error: migrateLegacyError(error) };
-      }),
-    })),
-  };
+  const history: HistoryData =
+    result.version === 2
+      ? result
+      : {
+          ...result,
+          version: 2,
+          operations: result.operations.map((operation) => ({
+            ...operation,
+            errors: operation.errors.map(migrateLegacyOperationError),
+            files: operation.files.map((file) => {
+              const { error, ...snapshot } = file;
+              return error === undefined
+                ? snapshot
+                : { ...snapshot, error: migrateLegacyError(error) };
+            }),
+          })),
+        };
+  if (data.updateMarkdownBases === true) history.updateMarkdownBases = true;
+  else delete history.updateMarkdownBases;
+  return history;
 }
 
 /** Returns whether a journal file entry has a whole-file snapshot or fence regions. */

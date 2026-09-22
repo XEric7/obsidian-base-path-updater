@@ -282,7 +282,18 @@ describe('plugin lifecycle and safe writes', () => {
         const openHistory = vi.spyOn(h.plugin, 'openHistory').mockImplementation(() => {});
         const tab = register.mock.calls[0]![0] as PluginSettingTab;
         const definitions = tab.getSettingDefinitions();
-        const history = definitions[0] as SettingDefinitionAction;
+        expect(definitions[0]).toMatchObject({
+          name: t('markdownName'),
+          desc: t('markdownDescription'),
+          control: { type: 'toggle', key: 'updateMarkdownBases', defaultValue: false },
+        });
+        expect(definitions[0]).toEqual(
+          expect.objectContaining({
+            aliases: expect.arrayContaining(['markdown', '嵌入']),
+          }),
+        );
+        expect(tab.getControlValue('updateMarkdownBases')).toBe(false);
+        const history = definitions[1] as SettingDefinitionAction;
         expect(history.name).toBe(t('historyName'));
         expect(command.mock.calls[0]![0].name).toBe(t('openHistory'));
         expect(command.mock.calls[0]![0].id).toBe('open-history');
@@ -293,6 +304,8 @@ describe('plugin lifecycle and safe writes', () => {
         expect(openHistory).toHaveBeenCalledTimes(1);
         tab.display();
         const sink = tab.containerEl as unknown as TestElement;
+        expect(sink.texts).toContain(t('markdownName'));
+        expect(sink.toggles[0]!.value).toBe(false);
         expect(sink.texts).toContain(history.name);
         expect(sink.texts).toContain(history.desc);
         expect(sink.buttons[0]!.text).toBe(t('historyButton'));
@@ -307,7 +320,7 @@ describe('plugin lifecycle and safe writes', () => {
   it('does not parse Bases on startup and only rewrites them on folder rename', async () => {
     const h = await setup({ 'view.base': 'filters: file.inFolder("Old")', 'note.md': 'Old' });
     expect(h.vault.read).not.toHaveBeenCalled();
-    expect(h.vault.cachedRead).toHaveBeenCalledTimes(1);
+    expect(h.vault.cachedRead).not.toHaveBeenCalled();
     expect(h.listeners.has('modify')).toBe(true);
     h.folderMove('Old', 'New');
     await h.flush();
@@ -412,6 +425,7 @@ describe('plugin lifecycle and safe writes', () => {
   it('updates embedded Markdown Bases and undoes fences without reverting other note edits', async () => {
     const source = '# Title\n```base\nfilters: file.inFolder("Old")\n```\nbody\n';
     const h = await setup({ 'note.md': source });
+    await h.plugin.setUpdateMarkdownBases(true);
     h.folderMove('Old', 'New');
     await h.flush();
     const file = [...h.contents.keys()][0]!;
@@ -432,6 +446,7 @@ describe('plugin lifecycle and safe writes', () => {
 
   it('adds and removes Markdown candidates on modify without rewriting paths', async () => {
     const h = await setup({ 'note.md': 'plain' });
+    await h.plugin.setUpdateMarkdownBases(true);
     const file = [...h.contents.keys()][0]!;
     h.folderMove('Old', 'New');
     await h.flush();
@@ -464,11 +479,34 @@ describe('plugin lifecycle and safe writes', () => {
             : { sections: [{ type: 'code' }] },
       },
     );
+    expect(h.vault.cachedRead).not.toHaveBeenCalled();
+    await h.plugin.setUpdateMarkdownBases(true);
     expect(h.vault.cachedRead.mock.calls.map(([file]) => file.path)).toEqual(['note.md']);
     h.folderMove('Old', 'New');
     await h.flush();
     const byPath = Object.fromEntries([...h.contents].map(([file, text]) => [file.path, text]));
     expect(byPath['plain.md']).toContain('file.inFolder("Old")');
     expect(byPath['note.md']).toContain('inFolder(\\"New\\")');
+  });
+
+  it('leaves Markdown Bases unchanged until the setting is enabled and remembers that choice', async () => {
+    const source = '```base\nfilters: file.inFolder("Old")\n```\n';
+    const h = await setup({ 'note.md': source });
+    h.folderMove('Old', 'New');
+    await h.flush();
+    const file = [...h.contents.keys()][0]!;
+    expect(h.contents.get(file)).toBe(source);
+    expect(h.vault.cachedRead).not.toHaveBeenCalled();
+    await h.plugin.setUpdateMarkdownBases(true);
+    const restarted = await setup({ 'note.md': source }, h.plugin.persisted);
+    expect(restarted.plugin.updateMarkdownBases).toBe(true);
+    restarted.folderMove('Old', 'New');
+    await restarted.flush();
+    expect([...restarted.contents.values()][0]).toContain('inFolder(\\"New\\")');
+    await restarted.plugin.setUpdateMarkdownBases(false);
+    expect(restarted.plugin.data.updateMarkdownBases).toBeUndefined();
+    restarted.folderMove('New', 'Final');
+    await restarted.flush();
+    expect([...restarted.contents.values()][0]).not.toContain('Final');
   });
 });

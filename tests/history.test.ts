@@ -44,6 +44,18 @@ it('validates persisted history before allowing automatic writes', () => {
   expect(() => readHistory({ version: 1, operations: [{}] })).toThrow();
 });
 
+it('preserves an enabled Markdown setting and drops any other stored value', () => {
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: true }).updateMarkdownBases,
+  ).toBe(true);
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: false }).updateMarkdownBases,
+  ).toBeUndefined();
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: 'yes' }).updateMarkdownBases,
+  ).toBeUndefined();
+});
+
 it('migrates v1 failures without changing snapshots, flags, or the original journal', () => {
   const input = legacyHistory();
   const original = structuredClone(input);

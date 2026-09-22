@@ -41,13 +41,13 @@ These sources support maintaining `.base` files directly without registering new
 ## Events and indexing
 
 1. Load and validate plugin `data.json`. If it cannot be read or has an unsupported format, pause automatic writes to avoid overwriting old history.
-2. Register events. On `onLayoutReady()`, list `.base` files into a `Set` without pre-reading their contents, then backfill Markdown notes that contain `base` fences. The backfill waits until metadata caches exist when the host provides them, skips notes whose cache has only non-code sections, and reads the rest with `cachedRead`. Work is yielded in small batches so startup stays responsive.
-3. Maintain the index incrementally when files are created, deleted, renamed, or—for Markdown—modified. Modify handlers only probe for fences; they do not parse YAML or join the write queue. Folder moves keep the `TFile` object references while the host updates their current paths.
+2. Register events. On `onLayoutReady()`, list `.base` files into a `Set` without pre-reading their contents. When **Update Bases embedded in Markdown** is on, backfill Markdown notes that contain `base` fences. The switch is stored in `data.json` and defaults to off. The backfill waits until metadata caches exist when the host provides them, skips notes whose cache has only non-code sections, and reads the rest with `cachedRead`. Work is yielded in small batches so startup stays responsive.
+3. Maintain the index incrementally when files are created, deleted, renamed, or—for Markdown, and only while the switch is on—modified. Modify handlers only probe for fences; they do not parse YAML or join the write queue. Turning the switch off drops Markdown files from the index immediately. Folder moves keep the `TFile` object references while the host updates their current paths.
 4. Capture `oldPath` and `newPath` on a folder `rename` event, then add the work to the promise queue. The queued task waits for the Markdown backfill, then snapshots the candidate set.
 5. Read candidate Bases sequentially and parse/write only files with matching content. Ordinary file renames update the index and history paths but do not scan content.
 6. After unload, stop checks at async read/save boundaries and process callbacks prevent further writes. A write already submitted to the host cannot be cancelled, so a replacement instance waits for outstanding writes before reading history. A global Symbol stores a WeakMap of pending writes across module reloads; completed entries are removed.
 
-Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer. Markdown `modify` events only maintain the fence index.
+Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer. While the Markdown switch is on, `modify` events only maintain the fence index.
 
 ## Path and YAML rewriting
 
@@ -77,7 +77,7 @@ Loading supports `version: 1`: exact known Chinese plugin messages become struct
 
 The public `getLanguage()` API selects simplified Chinese for Chinese locales and English otherwise. Commands, menus, settings, notifications, modal statuses, and errors share centralized translations. Language changes follow Obsidian's reload flow to register commands and search metadata again. Each history render uses the current language; dates use the same locale and the local time zone.
 
-Settings definitions include both English and Chinese search terms. Command names use the selected language while command IDs remain stable. Obsidian 1.13+ uses declarative settings; older versions use `display()`. Both share translations and history actions without duplicating business logic.
+Settings definitions include both English and Chinese search terms. Command names use the selected language while command IDs remain stable. Obsidian 1.13+ uses declarative settings; older versions use `display()`. Both share translations and history actions without duplicating business logic. The Markdown switch is a toggle in both renderers. It is off unless `updateMarkdownBases` is exactly `true`.
 
 ## Write ordering and conflict protection
 

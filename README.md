@@ -11,7 +11,7 @@ For example, when `Work/Research` is moved to `Archive/Research`, a Base that fi
 - **Automatic path updates**: Responds to folder renames and moves, including references to their subfolders and files.
 - **Multiple view levels**: Checks global Base filters, view-specific filters, and formulas.
 - **Reviewable undo history**: Shows before-and-after paths for each affected Base and can undo one complete folder operation.
-- **Lightweight daily use**: Does not scan on a timer. Ordinary note edits only refresh which notes contain Base fences; path rewriting still runs only after folder moves.
+- **Lightweight daily use**: Does not scan on a timer. Markdown notes are indexed only after you turn on embedded Base updates. Path rewriting still runs only after folder moves.
 
 ## Installation
 
@@ -51,7 +51,7 @@ When using `startsWith` for a folder, keep the trailing `/` as shown in the exam
 
 ## Scope and limitations
 
-- Standalone `.base` files and `base` code blocks embedded in Markdown are processed. Other fenced examples, such as a `base` block shown inside a longer outer fence, are left unchanged.
+- Standalone `.base` files are always processed. `base` code blocks embedded in Markdown are processed only when **Update Bases embedded in Markdown** is turned on in the plugin settings. That switch is off by default. Other fenced examples, such as a `base` block shown inside a longer outer fence, are left unchanged.
 - Only folder moves and renames trigger path updates. Renaming an individual note does not trigger a scan.
 - The plugin supports explicit fixed paths. Concatenated paths, variables, regular expressions, and other unsupported forms are not rewritten. YAML anchors, aliases, and custom tags are not expanded or modified.
 - View names, property display names, and ordinary text are not modified. Matching filters or formulas may be rewritten using YAML double-quoted strings while preserving their meaning.

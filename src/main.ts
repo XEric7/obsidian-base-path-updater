@@ -23,7 +23,13 @@ import {
 import { mayContainBaseFence, updateMarkdownBases } from './markdown-bases';
 import { HistoryModal } from './ui';
 import { PluginError, serializeError } from './errors';
-import { formatError, HISTORY_SEARCH_TERMS, t, type MessageKey } from './i18n';
+import {
+  formatError,
+  HISTORY_SEARCH_TERMS,
+  MARKDOWN_SEARCH_TERMS,
+  t,
+  type MessageKey,
+} from './i18n';
 import { runWrite, waitForWrites } from './write-coordinator';
 
 const INDEX_YIELD = 20;
@@ -82,12 +88,18 @@ export default class BasePathUpdater extends Plugin {
       this.app.vault.on('create', (file) => {
         if (!this.ready || !(file instanceof TFile)) return;
         if (file.extension === 'base') this.bases.add(file);
-        else if (file.extension === 'md') void this.inspectMarkdown(file, false);
+        else if (file.extension === 'md' && this.updateMarkdownBases)
+          void this.inspectMarkdown(file, false);
       }),
     );
     this.registerEvent(
       this.app.vault.on('modify', (file) => {
-        if (this.ready && file instanceof TFile && file.extension === 'md') {
+        if (
+          this.ready &&
+          this.updateMarkdownBases &&
+          file instanceof TFile &&
+          file.extension === 'md'
+        ) {
           void this.inspectMarkdown(file, false);
         }
       }),
@@ -118,7 +130,8 @@ export default class BasePathUpdater extends Plugin {
         const newPath = file.path;
         if (file instanceof TFile) {
           if (file.extension === 'base') this.bases.add(file);
-          else if (file.extension === 'md') void this.inspectMarkdown(file, false);
+          else if (file.extension === 'md' && this.updateMarkdownBases)
+            void this.inspectMarkdown(file, false);
           else this.bases.delete(file);
         }
         if (!this.ready) return;
@@ -150,7 +163,7 @@ export default class BasePathUpdater extends Plugin {
       if (this.stopped) return;
       this.bases = new Set(this.app.vault.getFiles().filter((file) => file.extension === 'base'));
       this.ready = true;
-      this.mdBackfill = this.scanMarkdownIndex();
+      if (this.updateMarkdownBases) this.mdBackfill = this.scanMarkdownIndex();
     });
   }
 
@@ -163,6 +176,32 @@ export default class BasePathUpdater extends Plugin {
   /** Opens the history modal in the current app language. */
   openHistory(): void {
     new HistoryModal(this).open();
+  }
+
+  /** Returns whether folder moves should also update Markdown `base` fences. */
+  get updateMarkdownBases(): boolean {
+    return this.data.updateMarkdownBases === true;
+  }
+
+  /** Persists the Markdown Base switch and rebuilds or clears the note index. */
+  async setUpdateMarkdownBases(enabled: boolean): Promise<void> {
+    if (this.storageFailed || this.updateMarkdownBases === enabled) return;
+    const previous = this.data.updateMarkdownBases;
+    if (enabled) this.data.updateMarkdownBases = true;
+    else delete this.data.updateMarkdownBases;
+    if (!(await this.persist())) {
+      if (previous === true) this.data.updateMarkdownBases = true;
+      else delete this.data.updateMarkdownBases;
+      return;
+    }
+    if (!enabled) {
+      for (const file of this.bases) {
+        if (file.extension === 'md') this.bases.delete(file);
+      }
+      return;
+    }
+    if (this.ready && !this.stopped) this.mdBackfill = this.scanMarkdownIndex();
+    await this.mdBackfill;
   }
 
   /** Displays the supplied message key and logs the caught error with translated details. */
@@ -233,7 +272,7 @@ export default class BasePathUpdater extends Plugin {
 
   /** Adds or removes a Markdown file from the candidate set using a cheap fence probe. */
   private async inspectMarkdown(file: TFile, useCache: boolean): Promise<void> {
-    if (this.stopped || file.extension !== 'md') return;
+    if (!this.updateMarkdownBases || this.stopped || file.extension !== 'md') return;
     if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
       this.bases.delete(file);
       return;
@@ -244,7 +283,7 @@ export default class BasePathUpdater extends Plugin {
     }
     try {
       const text = await this.app.vault.cachedRead(file);
-      if (this.stopped) return;
+      if (this.stopped || !this.updateMarkdownBases) return;
       if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
         this.bases.delete(file);
         return;
@@ -258,12 +297,13 @@ export default class BasePathUpdater extends Plugin {
 
   /** Reads Markdown notes once after layout is ready and records those with `base` fences. */
   private async scanMarkdownIndex(): Promise<void> {
+    if (!this.updateMarkdownBases) return;
     try {
       await this.waitForMetadata();
-      if (this.stopped) return;
+      if (this.stopped || !this.updateMarkdownBases) return;
       const files = this.markdownFiles();
       for (let index = 0; index < files.length; index++) {
-        if (this.stopped) return;
+        if (this.stopped || !this.updateMarkdownBases) return;
         await this.inspectMarkdown(files[index]!, true);
         if ((index + 1) % INDEX_YIELD === 0) {
           await new Promise((resolve) => setTimeout(resolve, 0));
@@ -288,6 +328,7 @@ export default class BasePathUpdater extends Plugin {
       if (this.stopped || this.storageFailed) break;
       if (
         (file.extension !== 'base' && file.extension !== 'md') ||
+        (file.extension === 'md' && !this.updateMarkdownBases) ||
         this.app.vault.getAbstractFileByPath(file.path) !== file
       )
         continue;
@@ -430,6 +471,12 @@ class HistorySettingTab extends PluginSettingTab {
   getSettingDefinitions(): SettingDefinitionItem[] {
     return [
       {
+        name: t('markdownName'),
+        desc: t('markdownDescription'),
+        aliases: [...MARKDOWN_SEARCH_TERMS],
+        control: { type: 'toggle', key: 'updateMarkdownBases', defaultValue: false },
+      },
+      {
         name: t('historyName'),
         desc: t('historyDescription'),
         aliases: [...HISTORY_SEARCH_TERMS],
@@ -439,9 +486,27 @@ class HistorySettingTab extends PluginSettingTab {
     ];
   }
 
+  /** Reads the Markdown Base switch from plugin data. */
+  override getControlValue(key: string): unknown {
+    return key === 'updateMarkdownBases' ? this.updater.updateMarkdownBases : undefined;
+  }
+
+  /** Persists the Markdown Base switch and refreshes the note index. */
+  override setControlValue(key: string, value: unknown): Promise<void> | void {
+    if (key === 'updateMarkdownBases') return this.updater.setUpdateMarkdownBases(value === true);
+  }
+
   /** Renders the history button on Obsidian versions older than 1.13. */
   display(): void {
     this.containerEl.empty();
+    new Setting(this.containerEl)
+      .setName(t('markdownName'))
+      .setDesc(t('markdownDescription'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.updater.updateMarkdownBases)
+          .onChange((value) => void this.updater.setUpdateMarkdownBases(value)),
+      );
     new Setting(this.containerEl)
       .setName(t('historyName'))
       .setDesc(t('historyDescription'))

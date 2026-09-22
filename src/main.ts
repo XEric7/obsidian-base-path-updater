@@ -15,21 +15,45 @@ import {
   MAX_HISTORY_BYTES,
   MAX_OPERATIONS,
   readHistory,
-  undoContent,
+  applyUndo,
   type FileChange,
   type HistoryData,
   type Operation,
 } from './history';
+import { mayContainBaseFence, updateMarkdownBases } from './markdown-bases';
 import { HistoryModal } from './ui';
 import { PluginError, serializeError } from './errors';
-import { formatError, HISTORY_SEARCH_TERMS, t, type MessageKey } from './i18n';
+import {
+  formatError,
+  HISTORY_SEARCH_TERMS,
+  MARKDOWN_SEARCH_TERMS,
+  t,
+  type MessageKey,
+} from './i18n';
 import { runWrite, waitForWrites } from './write-coordinator';
+
+const INDEX_YIELD = 20;
+const BENIGN_SECTIONS = new Set([
+  'yaml',
+  'paragraph',
+  'heading',
+  'list',
+  'blockquote',
+  'table',
+  'thematicBreak',
+  'html',
+  'footnoteDefinition',
+  'callout',
+  'text',
+]);
 
 /** Tracks folder moves, journals Base updates, and provides conflict-safe undo. */
 export default class BasePathUpdater extends Plugin {
   data: HistoryData = { version: 2, operations: [] };
   private bases = new Set<TFile>();
+  private pendingInspections = new Set<Promise<void>>();
   private queue: Promise<void> = Promise.resolve();
+  private mdBackfill: Promise<void> = Promise.resolve();
   private stopped = false;
   private ready = false;
   private storageFailed = false;
@@ -63,7 +87,15 @@ export default class BasePathUpdater extends Plugin {
     this.addSettingTab(new HistorySettingTab(this));
     this.registerEvent(
       this.app.vault.on('create', (file) => {
-        if (this.ready && file instanceof TFile && file.extension === 'base') this.bases.add(file);
+        if (!this.ready || !(file instanceof TFile)) return;
+        if (file.extension === 'base') this.bases.add(file);
+        else if (file.extension === 'md') this.watchMarkdown(file);
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on('modify', (file) => {
+        if (this.ready && file instanceof TFile && file.extension === 'md')
+          this.watchMarkdown(file);
       }),
     );
     this.registerEvent(
@@ -92,13 +124,14 @@ export default class BasePathUpdater extends Plugin {
         const newPath = file.path;
         if (file instanceof TFile) {
           if (file.extension === 'base') this.bases.add(file);
+          else if (file.extension === 'md' && this.updateMarkdownBases) this.watchMarkdown(file);
           else this.bases.delete(file);
         }
         if (!this.ready) return;
         const folder = file instanceof TFolder;
-        // Capture the event-time list, but retain TFile identities through subsequent moves.
-        const candidates = [...this.bases];
         void this.enqueue(async () => {
+          await this.mdBackfill;
+          if (this.stopped) return;
           let changed = false;
           for (const operation of this.data.operations) {
             for (const entry of operation.files) {
@@ -115,7 +148,10 @@ export default class BasePathUpdater extends Plugin {
             }
           }
           if (changed) await this.persist();
-          if (folder) await this.updateFolder(oldPath, newPath, candidates);
+          if (!folder || this.stopped) return;
+          await this.waitForInspections();
+          if (this.stopped) return;
+          await this.updateFolder(oldPath, newPath, [...this.bases]);
         });
       }),
     );
@@ -123,6 +159,7 @@ export default class BasePathUpdater extends Plugin {
       if (this.stopped) return;
       this.bases = new Set(this.app.vault.getFiles().filter((file) => file.extension === 'base'));
       this.ready = true;
+      if (this.updateMarkdownBases) this.mdBackfill = this.scanMarkdownIndex();
     });
   }
 
@@ -135,6 +172,32 @@ export default class BasePathUpdater extends Plugin {
   /** Opens the history modal in the current app language. */
   openHistory(): void {
     new HistoryModal(this).open();
+  }
+
+  /** Returns whether folder moves should also update Markdown `base` fences. */
+  get updateMarkdownBases(): boolean {
+    return this.data.updateMarkdownBases === true;
+  }
+
+  /** Persists the Markdown Base switch and rebuilds or clears the note index. */
+  async setUpdateMarkdownBases(enabled: boolean): Promise<void> {
+    if (this.storageFailed || this.updateMarkdownBases === enabled) return;
+    const previous = this.data.updateMarkdownBases;
+    if (enabled) this.data.updateMarkdownBases = true;
+    else delete this.data.updateMarkdownBases;
+    if (!(await this.persist())) {
+      if (previous === true) this.data.updateMarkdownBases = true;
+      else delete this.data.updateMarkdownBases;
+      return;
+    }
+    if (!enabled) {
+      for (const file of this.bases) {
+        if (file.extension === 'md') this.bases.delete(file);
+      }
+      return;
+    }
+    if (this.ready && !this.stopped) this.mdBackfill = this.scanMarkdownIndex();
+    await this.mdBackfill;
   }
 
   /** Displays the supplied message key and logs the caught error with translated details. */
@@ -170,6 +233,97 @@ export default class BasePathUpdater extends Plugin {
     }
   }
 
+  /** Returns Markdown files from the host listing, falling back to a full vault filter. */
+  private markdownFiles(): TFile[] {
+    if (typeof this.app.vault.getMarkdownFiles === 'function')
+      return this.app.vault.getMarkdownFiles();
+    return this.app.vault.getFiles().filter((file) => file.extension === 'md');
+  }
+
+  /** Waits until metadata caches exist or the host signals that initial indexing finished. */
+  private waitForMetadata(): Promise<void> {
+    const cache = this.app.metadataCache;
+    if (!cache) return Promise.resolve();
+    const ready = () => {
+      const files = this.markdownFiles();
+      return files.length === 0 || files.every((file) => cache.getFileCache(file) != null);
+    };
+    if (ready()) return Promise.resolve();
+    if (typeof cache.on !== 'function') return Promise.resolve();
+    return new Promise((resolve) => {
+      const finish = () => resolve();
+      this.registerEvent(cache.on('resolved', finish));
+      if (ready()) finish();
+    });
+  }
+
+  /** Returns whether a cached note still needs a content read to detect `base` fences. */
+  private shouldReadMarkdown(file: TFile): boolean {
+    const cached = this.app.metadataCache?.getFileCache(file);
+    if (cached == null) return true;
+    return (cached.sections ?? []).some(
+      (section) => section.type === 'code' || !BENIGN_SECTIONS.has(section.type),
+    );
+  }
+
+  /** Tracks one Markdown fence inspection so a folder move can wait for it. */
+  private watchMarkdown(file: TFile): void {
+    if (!this.ready || !this.updateMarkdownBases || this.stopped || file.extension !== 'md') return;
+    const task = this.inspectMarkdown(file, false).finally(() => {
+      this.pendingInspections.delete(task);
+    });
+    this.pendingInspections.add(task);
+  }
+
+  /** Waits until Markdown inspections started before this call, and any they queue, have finished. */
+  private async waitForInspections(): Promise<void> {
+    while (this.pendingInspections.size > 0) await Promise.all([...this.pendingInspections]);
+  }
+
+  /** Adds or removes a Markdown file from the candidate set using a cheap fence probe. */
+  private async inspectMarkdown(file: TFile, useCache: boolean): Promise<void> {
+    if (!this.updateMarkdownBases || this.stopped || file.extension !== 'md') return;
+    if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+      this.bases.delete(file);
+      return;
+    }
+    if (useCache && !this.shouldReadMarkdown(file)) {
+      this.bases.delete(file);
+      return;
+    }
+    try {
+      const text = await this.app.vault.cachedRead(file);
+      if (this.stopped || !this.updateMarkdownBases) return;
+      if (this.app.vault.getAbstractFileByPath(file.path) !== file) {
+        this.bases.delete(file);
+        return;
+      }
+      if (mayContainBaseFence(text)) this.bases.add(file);
+      else this.bases.delete(file);
+    } catch {
+      // Leave membership unchanged when the host cannot read the note.
+    }
+  }
+
+  /** Reads Markdown notes once after layout is ready and records those with `base` fences. */
+  private async scanMarkdownIndex(): Promise<void> {
+    if (!this.updateMarkdownBases) return;
+    try {
+      await this.waitForMetadata();
+      if (this.stopped || !this.updateMarkdownBases) return;
+      const files = this.markdownFiles();
+      for (let index = 0; index < files.length; index++) {
+        if (this.stopped || !this.updateMarkdownBases) return;
+        await this.inspectMarkdown(files[index]!, true);
+        if ((index + 1) % INDEX_YIELD === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+    } catch {
+      // Folder moves still proceed with whatever has been indexed.
+    }
+  }
+
   /** Updates candidate Bases for the supplied folder move and persists snapshots and failure codes. */
   private async updateFolder(oldPath: string, newPath: string, candidates: TFile[]): Promise<void> {
     const operation: Operation = {
@@ -182,20 +336,29 @@ export default class BasePathUpdater extends Plugin {
     };
     for (const file of candidates) {
       if (this.stopped || this.storageFailed) break;
-      if (file.extension !== 'base' || this.app.vault.getAbstractFileByPath(file.path) !== file)
+      if (
+        (file.extension !== 'base' && file.extension !== 'md') ||
+        (file.extension === 'md' && !this.updateMarkdownBases) ||
+        this.app.vault.getAbstractFileByPath(file.path) !== file
+      )
         continue;
       let entry: FileChange | undefined;
       try {
         const before = await this.app.vault.read(file);
         if (this.stopped) return;
-        const update = updateBase(before, oldPath, newPath);
+        const update =
+          file.extension === 'base'
+            ? { ...updateBase(before, oldPath, newPath), regions: undefined, errors: [] }
+            : updateMarkdownBases(before, oldPath, newPath);
+        for (const error of update.errors) operation.errors.push({ path: file.path, error });
         if (!update.changes.length) continue;
         const candidate: FileChange = {
           path: file.path,
-          before,
-          after: update.text,
           changes: update.changes,
           undone: false,
+          ...(update.regions?.length
+            ? { regions: update.regions }
+            : { before, after: update.text }),
         };
         // Check the active operation alone before changing any existing history.
         const proposed = { ...operation, files: [...operation.files, candidate] };
@@ -264,18 +427,28 @@ export default class BasePathUpdater extends Plugin {
         if (entry.undone) continue;
         try {
           const file = this.app.vault.getAbstractFileByPath(entry.path);
-          if (entry.missing || !(file instanceof TFile) || file.extension !== 'base') {
+          if (entry.missing || !(file instanceof TFile) || !canUndoFile(file, entry)) {
             throw new PluginError({ code: 'missingBase' });
           }
+          let conflict = false;
           await runWrite(this.app, async () => {
             if (this.stopped) return;
-            await this.app.vault.process(file, (current) =>
-              this.stopped ? current : undoContent(current, entry),
-            );
+            await this.app.vault.process(file, (current) => {
+              if (this.stopped) return current;
+              const result = applyUndo(current, entry);
+              conflict = result.conflict;
+              if (result.conflict && result.text === current) {
+                throw new PluginError({ code: 'undoConflict' });
+              }
+              return result.text;
+            });
           });
           if (this.stopped) return;
-          entry.undone = true;
-          delete entry.error;
+          if (conflict) entry.error = { code: 'undoConflict' };
+          else {
+            entry.undone = true;
+            delete entry.error;
+          }
         } catch (error) {
           if (this.stopped) return;
           entry.error = serializeError(error);
@@ -285,6 +458,16 @@ export default class BasePathUpdater extends Plugin {
       new Notice(t('undoComplete'));
     });
   }
+}
+
+/** Returns whether the live file can still receive the recorded snapshot. */
+function canUndoFile(file: TFile, entry: FileChange): boolean {
+  if (file.extension === 'base') return true;
+  return (
+    file.extension === 'md' &&
+    (Boolean(entry.regions?.length) ||
+      (typeof entry.before === 'string' && typeof entry.after === 'string'))
+  );
 }
 
 /** Exposes searchable history access, with legacy settings rendering as a fallback. */
@@ -298,6 +481,12 @@ class HistorySettingTab extends PluginSettingTab {
   getSettingDefinitions(): SettingDefinitionItem[] {
     return [
       {
+        name: t('markdownName'),
+        desc: t('markdownDescription'),
+        aliases: [...MARKDOWN_SEARCH_TERMS],
+        control: { type: 'toggle', key: 'updateMarkdownBases', defaultValue: false },
+      },
+      {
         name: t('historyName'),
         desc: t('historyDescription'),
         aliases: [...HISTORY_SEARCH_TERMS],
@@ -307,9 +496,27 @@ class HistorySettingTab extends PluginSettingTab {
     ];
   }
 
+  /** Reads the Markdown Base switch from plugin data. */
+  override getControlValue(key: string): unknown {
+    return key === 'updateMarkdownBases' ? this.updater.updateMarkdownBases : undefined;
+  }
+
+  /** Persists the Markdown Base switch and refreshes the note index. */
+  override setControlValue(key: string, value: unknown): Promise<void> | void {
+    if (key === 'updateMarkdownBases') return this.updater.setUpdateMarkdownBases(value === true);
+  }
+
   /** Renders the history button on Obsidian versions older than 1.13. */
   display(): void {
     this.containerEl.empty();
+    new Setting(this.containerEl)
+      .setName(t('markdownName'))
+      .setDesc(t('markdownDescription'))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.updater.updateMarkdownBases)
+          .onChange((value) => void this.updater.setUpdateMarkdownBases(value)),
+      );
     new Setting(this.containerEl)
       .setName(t('historyName'))
       .setDesc(t('historyDescription'))

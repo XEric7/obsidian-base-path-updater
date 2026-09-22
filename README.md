@@ -11,7 +11,7 @@ For example, when `Work/Research` is moved to `Archive/Research`, a Base that fi
 - **Automatic path updates**: Responds to folder renames and moves, including references to their subfolders and files.
 - **Multiple view levels**: Checks global Base filters, view-specific filters, and formulas.
 - **Reviewable undo history**: Shows before-and-after paths for each affected Base and can undo one complete folder operation.
-- **Lightweight daily use**: Does not scan on a timer or react to ordinary note edits; it only checks Bases after folder path changes.
+- **Lightweight daily use**: Does not scan on a timer. Markdown notes are indexed only after you turn on embedded Base updates. Path rewriting still runs only after folder moves.
 
 ## Installation
 
@@ -35,7 +35,7 @@ You can open the history in three ways:
 
 Expand an entry to see how each Base path changed, then select **Undo Base changes** to restore it. History persists across restarts and keeps up to **30 operations**, with a snapshot budget of approximately **5 MiB**. When the budget is reached, the oldest entries are removed first. If one operation is too large, files that would exceed the budget are skipped and reported.
 
-**Undo restores Base content only; it does not move folders back.** To keep a filter valid, move the folder back to its original location. When undoing multiple operations, start with the newest entry. If a file was manually edited, changed by a later operation, or deleted, the plugin skips it instead of overwriting newer content; other files from the same operation can still be undone.
+**Undo restores Base content only; it does not move folders back.** To keep a filter valid, move the folder back to its original location. When undoing multiple operations, start with the newest entry. If a `.base` file was manually edited, changed by a later operation, or deleted, the plugin skips it instead of overwriting newer content. For Bases embedded in Markdown, undo restores matching `base` code blocks and keeps other note edits. Other files from the same operation can still be undone.
 
 ## Supported path forms
 
@@ -51,7 +51,7 @@ When using `startsWith` for a folder, keep the trailing `/` as shown in the exam
 
 ## Scope and limitations
 
-- Only standalone `.base` files are processed. Base code blocks embedded in Markdown are not processed.
+- Standalone `.base` files are always processed. `base` code blocks embedded in Markdown are processed only when **Update Bases embedded in Markdown** is turned on in the plugin settings. That switch is off by default. Other fenced examples, such as a `base` block shown inside a longer outer fence, are left unchanged.
 - Only folder moves and renames trigger path updates. Renaming an individual note does not trigger a scan.
 - The plugin supports explicit fixed paths. Concatenated paths, variables, regular expressions, and other unsupported forms are not rewritten. YAML anchors, aliases, and custom tags are not expanded or modified.
 - View names, property display names, and ordinary text are not modified. Matching filters or formulas may be rewritten using YAML double-quoted strings while preserving their meaning.

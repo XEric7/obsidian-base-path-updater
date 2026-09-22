@@ -20,10 +20,12 @@ export class Notice {
 export class TestElement {
   texts: string[] = [];
   buttons: TestButton[] = [];
-  /** Clears captured text and buttons. */
+  toggles: TestToggle[] = [];
+  /** Clears captured text, buttons, and toggles. */
   empty(): void {
     this.texts.length = 0;
     this.buttons.length = 0;
+    this.toggles.length = 0;
   }
   /** Accepts a CSS class without affecting text capture. */
   addClass(_name: string): void {}
@@ -42,6 +44,21 @@ export class TestElement {
   }
 }
 
+/** Captures a rendered toggle value and change handler. */
+export class TestToggle {
+  value = false;
+  change: (value: boolean) => unknown = () => {};
+  /** Stores the supplied value and returns this toggle. */
+  setValue(value: boolean): this {
+    this.value = value;
+    return this;
+  }
+  /** Stores the supplied change callback and returns this toggle. */
+  onChange(callback: (value: boolean) => unknown): this {
+    this.change = callback;
+    return this;
+  }
+}
 /** Captures a rendered button label, disabled state, and click handler. */
 export class TestButton {
   text = '';
@@ -96,6 +113,13 @@ export class Setting {
     const button = new TestButton();
     callback(button);
     this.container.buttons.push(button);
+    return this;
+  }
+  /** Configures and records a toggle using the supplied callback, then returns this row. */
+  addToggle(callback: (toggle: TestToggle) => unknown): this {
+    const toggle = new TestToggle();
+    callback(toggle);
+    this.container.toggles.push(toggle);
     return this;
   }
 }

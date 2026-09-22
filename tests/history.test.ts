@@ -44,6 +44,18 @@ it('validates persisted history before allowing automatic writes', () => {
   expect(() => readHistory({ version: 1, operations: [{}] })).toThrow();
 });
 
+it('preserves an enabled Markdown setting and drops any other stored value', () => {
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: true }).updateMarkdownBases,
+  ).toBe(true);
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: false }).updateMarkdownBases,
+  ).toBeUndefined();
+  expect(
+    readHistory({ version: 2, operations: [], updateMarkdownBases: 'yes' }).updateMarkdownBases,
+  ).toBeUndefined();
+});
+
 it('migrates v1 failures without changing snapshots, flags, or the original journal', () => {
   const input = legacyHistory();
   const original = structuredClone(input);
@@ -57,8 +69,8 @@ it('migrates v1 failures without changing snapshots, flags, or the original jour
     { path: '目录：a.base', error: { code: 'invalidYaml' } },
     { error: { code: 'external', params: { message: 'unrecognized host error: EIO' } } },
   ]);
-  expect(undoContent(file.after, file)).toBe(file.before);
-  expect(() => undoContent(file.after + 'edited', file)).toThrow('undoConflict');
+  expect(undoContent(file.after!, file)).toBe(file.before);
+  expect(() => undoContent(file.after! + 'edited', file)).toThrow('undoConflict');
   expect(readHistory(JSON.parse(JSON.stringify(migrated)))).toEqual(migrated);
 });
 
@@ -124,7 +136,108 @@ it('rejects corrupt operation errors and null entries before migration', () => {
   ).toThrow('historyCorrupt');
 });
 
-/** Checks both journal versions against valid and malformed path-change entries. */
+it('validates fence-region snapshots without requiring a whole-file copy', () => {
+  const data = {
+    version: 2,
+    operations: [
+      {
+        id: 'note',
+        timestamp: 1,
+        oldPath: 'Old',
+        newPath: 'New',
+        errors: [],
+        files: [
+          {
+            path: 'note.md',
+            regions: [{ before: '```base\nold\n```\n', after: '```base\nnew\n```\n' }],
+            changes: [{ before: 'Old', after: 'New' }],
+            undone: false,
+          },
+        ],
+      },
+    ],
+  };
+  expect(readHistory(data).operations[0]!.files[0]!.regions).toEqual(
+    data.operations[0]!.files[0]!.regions,
+  );
+  expect(() =>
+    readHistory({
+      ...data,
+      operations: [
+        { ...data.operations[0]!, files: [{ path: 'note.md', changes: [], undone: false }] },
+      ],
+    }),
+  ).toThrow('historyCorrupt');
+});
+
+it('restores matching fence snapshots and keeps unrelated note edits', () => {
+  const change: FileChange = {
+    path: 'note.md',
+    regions: [
+      {
+        before: '```base\nfilters: file.inFolder("Old")\n```',
+        after: '```base\nfilters: file.inFolder("New")\n```',
+      },
+    ],
+    changes: [{ before: 'Old', after: 'New' }],
+    undone: false,
+  };
+  const edited = '# title\n```base\nfilters: file.inFolder("New")\n```\nnote edit\n';
+  expect(undoContent(edited, change)).toBe(
+    '# title\n```base\nfilters: file.inFolder("Old")\n```\nnote edit\n',
+  );
+  expect(undoContent(undoContent(edited, change), change)).toBe(
+    '# title\n```base\nfilters: file.inFolder("Old")\n```\nnote edit\n',
+  );
+});
+
+it('restores an untouched fence when another fence in the same note was edited', () => {
+  const first = {
+    before: '```base\nfilters: file.inFolder("Old")\n```',
+    after: '```base\nfilters: file.inFolder("New")\n```',
+  };
+  const second = {
+    before: '```base\nformulas: { x: "file.inFolder(\\"Old\\")" }\n```',
+    after: '```base\nformulas: { x: "file.inFolder(\\"New\\")" }\n```',
+  };
+  const change: FileChange = {
+    path: 'note.md',
+    regions: [first, second],
+    changes: [],
+    undone: false,
+  };
+  const current = `# keep\n${second.after}\n${first.after.replace('New', 'Edited')}\n`;
+  const restored = undoContent(current, change);
+  expect(restored).toContain(second.before);
+  expect(restored).toContain(first.after.replace('New', 'Edited'));
+});
+
+it('does not overwrite a fence that no longer matches either snapshot', () => {
+  const change: FileChange = {
+    path: 'note.md',
+    regions: [
+      {
+        before: '```base\nfilters: file.inFolder("Old")\n```',
+        after: '```base\nfilters: file.inFolder("New")\n```',
+      },
+    ],
+    changes: [],
+    undone: false,
+  };
+  expect(() => undoContent('# rewritten\n', change)).toThrow('undoConflict');
+});
+
+it('reports a conflict when an identical fence snapshot matches more than one place', () => {
+  const after = '```base\nfilters: file.inFolder("New")\n```';
+  const change: FileChange = {
+    path: 'note.md',
+    regions: [{ before: after.replace('New', 'Old'), after }],
+    changes: [],
+    undone: false,
+  };
+  expect(() => undoContent(`${after}\n\n${after}\n`, change)).toThrow('undoConflict');
+});
+
 it.each([1, 2] as const)('validates path-change objects in v%i history', (version) => {
   const data = version === 1 ? legacyHistory() : readHistory(legacyHistory());
   const file = data.operations[0]!.files[0]!;

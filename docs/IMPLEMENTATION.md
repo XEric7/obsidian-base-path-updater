@@ -4,7 +4,7 @@
 
 ## Goals and scope
 
-This plugin keeps fixed path references in `.base` files valid after folders are moved or renamed. The first release keeps the original event-driven approach while adding structured recognition, serialized processing, write-ahead snapshots, and conflict protection. Ordinary note edits do not trigger work, and the plugin does not take over Obsidian's link updating.
+This plugin keeps fixed path references in `.base` files and Markdown `base` fences valid after folders are moved or renamed. The first release keeps the original event-driven approach while adding structured recognition, serialized processing, write-ahead snapshots, and conflict protection. Ordinary note edits do not rewrite paths, and the plugin does not take over Obsidian's link updating.
 
 User-facing documentation is in the [README](../README.md). This document explains implementation decisions and maintenance practices.
 
@@ -24,29 +24,30 @@ These sources support maintaining `.base` files directly without registering new
 
 ## Module structure
 
-| File                   | Responsibility                                                                        |
-| ---------------------- | ------------------------------------------------------------------------------------- |
-| `src/main.ts`          | Plugin lifecycle, file index, serialized tasks, persistence, and undo                 |
-| `src/base-document.ts` | Locates expressions that may be changed in YAML and patches their source ranges       |
-| `src/expressions.ts`   | Expression tokenization, fixed-path recognition, path boundaries, and string escaping |
-| `src/history.ts`       | History data structures, size accounting, validation, and undo conditions             |
-| `src/ui.ts`            | History modal, path differences, undo entry points, and error feedback                |
-| `src/i18n.ts`          | English/Chinese UI messages, error formatting, and localized dates                    |
-| `src/errors.ts`        | Failure codes and parameters, exception serialization, and legacy message migration   |
-| `tests/`               | Pure-function tests and lifecycle tests using a simulated Obsidian API                |
+| File                    | Responsibility                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------- |
+| `src/main.ts`           | Plugin lifecycle, file index, serialized tasks, persistence, and undo                 |
+| `src/base-document.ts`  | Locates expressions that may be changed in YAML and patches their source ranges       |
+| `src/markdown-bases.ts` | Finds Markdown `base` fences, reuses YAML rewrites, and returns fence snapshots       |
+| `src/expressions.ts`    | Expression tokenization, fixed-path recognition, path boundaries, and string escaping |
+| `src/history.ts`        | History data structures, size accounting, validation, and undo conditions             |
+| `src/ui.ts`             | History modal, path differences, undo entry points, and error feedback                |
+| `src/i18n.ts`           | English/Chinese UI messages, error formatting, and localized dates                    |
+| `src/errors.ts`         | Failure codes and parameters, exception serialization, and legacy message migration   |
+| `tests/`                | Pure-function tests and lifecycle tests using a simulated Obsidian API                |
 
 `src/write-coordinator.ts` coordinates outstanding writes in the same host so plugin reloads do not read stale history.
 
 ## Events and indexing
 
 1. Load and validate plugin `data.json`. If it cannot be read or has an unsupported format, pause automatic writes to avoid overwriting old history.
-2. Register events. On `onLayoutReady()`, call `vault.getFiles()` once and store `.base` `TFile` objects in a `Set` without pre-reading their contents.
-3. Maintain the index incrementally when files are created, deleted, or renamed. Folder moves keep the `TFile` object references while the host updates their current paths.
-4. Capture `oldPath`, `newPath`, and the candidate file list immediately on a folder `rename` event, then add the work to the promise queue.
+2. Register events. On `onLayoutReady()`, list `.base` files into a `Set` without pre-reading their contents. When **Update Bases embedded in Markdown** is on, backfill Markdown notes that contain `base` fences. The switch is stored in `data.json` and defaults to off. The backfill waits until metadata caches exist when the host provides them, skips notes whose cache has only non-code sections, and reads the rest with `cachedRead`. Work is yielded in small batches so startup stays responsive.
+3. Maintain the index incrementally when files are created, deleted, renamed, or—for Markdown, and only while the switch is on—modified. Modify handlers only probe for fences; they do not parse YAML or join the write queue. Turning the switch off drops Markdown files from the index immediately. Folder moves keep the `TFile` object references while the host updates their current paths.
+4. Capture `oldPath` and `newPath` on a folder `rename` event, then add the work to the promise queue. The queued task waits for the Markdown backfill and for any in-flight note inspections, then snapshots the candidate set.
 5. Read candidate Bases sequentially and parse/write only files with matching content. Ordinary file renames update the index and history paths but do not scan content.
 6. After unload, stop checks at async read/save boundaries and process callbacks prevent further writes. A write already submitted to the host cannot be cancelled, so a replacement instance waits for outstanding writes before reading history. A global Symbol stores a WeakMap of pending writes across module reloads; completed entries are removed.
 
-Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer and ordinary `modify` events are not observed.
+Automatic updates and undo share one queue to prevent consecutive moves or repeated clicks from overwriting one another. There is no timer. While the Markdown switch is on, `modify` events only maintain the fence index.
 
 ## Path and YAML rewriting
 
@@ -66,7 +67,7 @@ The plugin does not replace text across an entire file or serialize the whole YA
 
 ## Writes, history, and undo
 
-Each folder change creates an operation containing its timestamp, old and new folder paths, complete before-and-after snapshots for each affected Base, path differences, and errors. History is stored as `version: 2` in the plugin's `data.json`.
+Each folder change creates an operation containing its timestamp, old and new folder paths, snapshots for each affected Base, path differences, and errors. Standalone `.base` files store whole-file snapshots. Markdown notes store only the rewritten `base` fences. History is stored as `version: 2` in the plugin's `data.json`.
 
 Plugin failures store a stable `code` and any required `params`. Operation failures store the event-time file path separately and are translated when displayed. System and third-party errors use `external` with the original message. Paths, Base content, and snapshots are never translated.
 
@@ -76,7 +77,7 @@ Loading supports `version: 1`: exact known Chinese plugin messages become struct
 
 The public `getLanguage()` API selects simplified Chinese for Chinese locales and English otherwise. Commands, menus, settings, notifications, modal statuses, and errors share centralized translations. Language changes follow Obsidian's reload flow to register commands and search metadata again. Each history render uses the current language; dates use the same locale and the local time zone.
 
-Settings definitions include both English and Chinese search terms. Command names use the selected language while command IDs remain stable. Obsidian 1.13+ uses declarative settings; older versions use `display()`. Both share translations and history actions without duplicating business logic.
+Settings definitions include both English and Chinese search terms. Command names use the selected language while command IDs remain stable. Obsidian 1.13+ uses declarative settings; older versions use `display()`. Both share translations and history actions without duplicating business logic. The Markdown switch is a toggle in both renderers. It is off unless `updateMarkdownBases` is exactly `true`.
 
 ## Write ordering and conflict protection
 
@@ -90,22 +91,24 @@ For each file, the write order is:
 
 This is a recoverable per-file operation, not an atomic transaction across multiple files. A failure in one file does not prevent other files from being processed, so a partial update is possible.
 
-Undo also uses `vault.process()` to compare complete contents:
+Undo also uses `vault.process()`. Standalone `.base` files compare complete contents:
 
 - If the current content equals `after`, restore `before`.
 - If the current content equals `before`, treat it as already restored or as a write that never happened; do not write again.
 - Otherwise mark a conflict and preserve the current file.
-- If the original file was deleted or is no longer a `.base` file, do not restore or recreate it. Deletions observed during runtime are persisted so undo cannot target a new file at the same path.
+- If the original file was deleted or is no longer a `.base` file or Markdown note, do not restore or recreate it. Deletions observed during runtime are persisted so undo cannot target a new file at the same path.
+
+Markdown notes restore by exact fence text rather than file offsets. Each changed fence also stores nearby text when that fence's new text is not unique, and undo refuses the note when more than one match remains. Matching `after` fences become `before`, already-restored fences are left alone, and a fence the user edited is skipped while other fences in the same note can still undo. Fences inside HTML comments or raw `script`, `pre`, `style`, and `textarea` blocks are not Base content and are left unchanged. The update write itself still requires the whole file to match the read snapshot, so a concurrent save during the folder move is skipped.
 
 The write-ahead snapshot can show whether a write happened after a process interruption. A history entry marked as recorded means that a verifiable snapshot exists; it does not promise that an interrupted transaction completed. After a restart, current content is checked. A file deleted and recreated with identical content while the plugin was disabled cannot be identified by path alone.
 
 History updates Base and parent-folder paths when the plugin observes their renames; moves while it is disabled cannot be tracked. Undo never moves folders and history is not a replacement for a complete backup.
 
-Complete snapshots provide strict conflict protection, but even a user change to a comment causes undo to skip the file. The first release chooses conservative skipping instead of risking an incorrect partial reverse replacement.
+Complete snapshots provide strict conflict protection for `.base` files, but even a user change to a comment causes undo to skip that file. Markdown undo is fence-scoped so ordinary note edits outside the Base do not block restore.
 
 ## Performance boundaries
 
-Startup performs one file-list traversal; ordinary edits do not read Base contents. Each folder change performs I/O proportional to the total size of candidate Bases, and parsing occurs only for files that may contain a match. Sequential reads and writes avoid large bursts of I/O; there is no content cache or continuously parsed index.
+Startup lists `.base` files, then reads Markdown notes that may contain `base` fences. Ordinary edits do not parse YAML or rewrite paths. Each folder change performs I/O proportional to the candidate set (`.base` files plus notes known to contain fences), and parsing occurs only for files that may contain a match. Sequential reads and writes avoid large bursts of I/O; there is no YAML content cache or continuously parsed index.
 
 At most 30 operations are retained, with a 5 MiB snapshot budget. Small metadata such as error messages may make the final JSON slightly exceed the budget. Size is measured in UTF-8 bytes. Because each file's snapshot is saved before its write, a large batch of matches incurs extra serialization and disk cost; there is currently no performance claim for large vaults. A separate log file may be considered after real usage data is available, rather than adding complexity prematurely.
 
@@ -132,7 +135,7 @@ For tag-triggered releases, see the [release guide](RELEASING.md) (Chinese).
 
 ## Validation and manual acceptance
 
-Automated tests cover path boundaries, nested filters, quotes and escapes, CRLF, block scalars, comments, anchor protection, skipped dynamic expressions, invalid YAML, queue ordering, concurrent edits before writes, history-save failures, undo after restart, deletion protection, and stopping on unload. The host is represented by a simulated API; this is not the same as end-to-end testing in the real Obsidian client.
+Automated tests cover path boundaries, nested filters, quotes and escapes, CRLF, block scalars, comments, anchor protection, skipped dynamic expressions, invalid YAML, Markdown `base` fences, queue ordering, concurrent edits before writes, history-save failures, undo after restart, deletion protection, and stopping on unload. The host is represented by a simulated API; this is not the same as end-to-end testing in the real Obsidian client.
 
 Recommended acceptance checks in a test vault:
 
@@ -142,10 +145,11 @@ Recommended acceptance checks in a test vault:
 4. Open history and undo from newest to oldest. Confirm that only Base content is restored and folder locations do not change.
 5. Edit a comment in one Base before undoing. Confirm that the file is skipped while other files can still be restored.
 6. Restart Obsidian, inspect history, and undo. Check the ribbon menu, command palette, and settings entry points.
-7. Create, delete, and rename `.base` files and confirm that the index follows them; ordinary note edits should not create history.
-8. Check light and dark themes and the mobile modal. The plugin does not use desktop-only APIs, but mobile still requires testing on a real device.
-9. Start Obsidian in English and Chinese and inspect commands, menus, notifications, history statuses, and errors. On 1.13+, search settings for `history`, `undo`, `更新历史`, and `撤回`; on older versions, check the settings button. After changing language, known plugin failures in existing history should follow the UI language while external messages and snapshots remain unchanged.
+7. Create, delete, and rename `.base` files and notes that contain `base` fences and confirm that the index follows them; ordinary note edits should not create history.
+8. Embed a Base in Markdown, move a folder it references, then edit text outside the fence and undo; confirm the fence is restored and the other edit remains. Edit inside the fence and confirm that block is skipped.
+9. Check light and dark themes and the mobile modal. The plugin does not use desktop-only APIs, but mobile still requires testing on a real device.
+10. Start Obsidian in English and Chinese and inspect commands, menus, notifications, history statuses, and errors. On 1.13+, search settings for `history`, `undo`, `更新历史`, and `撤回`; on older versions, check the settings button. After changing language, known plugin failures in existing history should follow the UI language while external messages and snapshots remain unchanged.
 
 ## Possible future improvements
 
-Based on actual needs, consider more path functions, embedded Bases, file-level moves, a manual repair preview, and a precise expression syntax tree. Add false-positive tests alongside any new supported syntax, and do not automatically rewrite ordinary path strings as references.
+Based on actual needs, consider more path functions, file-level moves, a manual repair preview, and a precise expression syntax tree. Add false-positive tests alongside any new supported syntax, and do not automatically rewrite ordinary path strings as references.

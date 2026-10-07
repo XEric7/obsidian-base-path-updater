@@ -316,7 +316,7 @@ export default class BasePathUpdater extends Plugin {
         if (this.stopped || !this.updateMarkdownBases) return;
         await this.inspectMarkdown(files[index]!, true);
         if ((index + 1) % INDEX_YIELD === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 0));
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
         }
       }
     } catch {
